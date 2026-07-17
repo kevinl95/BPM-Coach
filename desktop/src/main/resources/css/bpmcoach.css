@@ -1,0 +1,65 @@
+.root {
+    -fx-font-family: "Segoe UI", "Helvetica Neue", sans-serif;
+    -fx-background-color: #1b1d23;
+}
+
+.projector-view {
+    -fx-padding: 24;
+    -fx-background-color: #1b1d23;
+}
+
+.zone-tile {
+    -fx-background-radius: 12;
+    -fx-border-radius: 12;
+    -fx-border-width: 3;
+}
+
+.tile-name {
+    -fx-font-size: 22px;
+    -fx-font-weight: bold;
+    -fx-text-fill: #101114;
+}
+
+.tile-bpm {
+    -fx-font-size: 40px;
+    -fx-font-weight: bold;
+    -fx-text-fill: #101114;
+}
+
+.zone-unknown {
+    -fx-background-color: #4a4e58;
+    -fx-border-color: #6a6f7a;
+}
+.zone-unknown .tile-name, .zone-unknown .tile-bpm {
+    -fx-text-fill: #e6e6e6;
+}
+
+.zone-low {
+    -fx-background-color: #f5d547;
+    -fx-border-color: #c9a900;
+}
+
+.zone-target {
+    -fx-background-color: #4caf50;
+    -fx-border-color: #357a38;
+}
+.zone-target .tile-name, .zone-target .tile-bpm {
+    -fx-text-fill: #f2fff2;
+}
+
+.zone-high {
+    -fx-background-color: #e53935;
+    -fx-border-color: #a92722;
+}
+.zone-high .tile-name, .zone-high .tile-bpm {
+    -fx-text-fill: #fff0f0;
+}
+
+.history-view, .zone-config-view, .pairing-view {
+    -fx-background-color: #1b1d23;
+}
+
+.history-view .label, .zone-config-view .label, .pairing-view .label {
+    -fx-text-fill: #e6e6e6;
+    -fx-font-size: 14px;
+}

@@ -1,0 +1,15 @@
+[versions]
+junit = "6.1.2"
+javafxVersion = "26.0.1"
+javafx-plugin = "0.1.0"
+jlink-plugin = "4.0.2"
+spotless-plugin = "8.8.0"
+google-java-format = "1.35.0"
+
+[libraries]
+junit-jupiter = { module = "org.junit.jupiter:junit-jupiter", version.ref = "junit" }
+
+[plugins]
+javafx = { id = "org.openjfx.javafxplugin", version.ref = "javafx-plugin" }
+jlink = { id = "org.beryx.jlink", version.ref = "jlink-plugin" }
+spotless = { id = "com.diffplug.spotless", version.ref = "spotless-plugin" }
