@@ -95,6 +95,14 @@ public final class ClassSession implements AutoCloseable {
         .ifPresent(student -> upsertStudent(new Student(student.id(), student.name(), null)));
   }
 
+  /** Removes a student from the roster entirely (not just their band assignment). */
+  public void removeStudent(String studentId) {
+    roster.remove(studentId);
+    latest.remove(studentId);
+    history.remove(studentId);
+    publisher.submit(currentSnapshot());
+  }
+
   public void updateZoneConfig(ZoneConfig config) {
     zoneConfig.set(config);
     publisher.submit(currentSnapshot());

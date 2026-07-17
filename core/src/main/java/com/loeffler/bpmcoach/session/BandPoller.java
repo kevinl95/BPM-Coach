@@ -5,6 +5,7 @@ import com.loeffler.bpmcoach.protocol.FrameParser;
 import com.loeffler.bpmcoach.protocol.LaxasfitProtocol;
 import com.loeffler.bpmcoach.transport.BandConnection;
 import com.loeffler.bpmcoach.transport.BleTransport;
+import java.lang.System.Logger.Level;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -12,6 +13,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Flow;
 import java.util.concurrent.StructuredTaskScope;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
 /**
@@ -24,10 +26,29 @@ import java.util.function.Consumer;
  */
 public final class BandPoller {
 
+  private static final System.Logger LOG = System.getLogger(BandPoller.class.getName());
+
   public static final int BATCH_SIZE = 6;
-  private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(8);
-  private static final Duration MEASUREMENT_WAIT = Duration.ofSeconds(12);
-  private static final Duration BATCH_TIMEOUT = Duration.ofSeconds(20);
+  // SimpleBleTransport.connect() includes not just the GATT link but a wait for BlueZ to
+  // resolve the service table (up to ~6s on its own - see SimpleBleTransport), so this needs
+  // margin beyond just the physical connection time.
+  private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(15);
+  private static final Duration WRITE_TIMEOUT = Duration.ofSeconds(5);
+  // The real band's own measurement cycle is documented at ~8-10s; this leaves real margin
+  // beyond that, since a slow/laggy BLE connection interval can delay notification delivery
+  // even after the band has actually finished measuring.
+  private static final Duration MEASUREMENT_WAIT = Duration.ofSeconds(15);
+  // Confirmed against real hardware: the band's cheap radio negotiates an aggressive low-power
+  // connection interval (no requestConnectionPriority equivalent exists in this BLE binding to
+  // fix that, unlike the Android reference client), so a notification can be genuinely dropped
+  // rather than merely late - the band's own screen has shown a reading that never arrived over
+  // BLE. Waiting longer for that same notification wouldn't help; re-sending CMD_HR_START on the
+  // SAME still-open connection (cheap - no reconnect) gives it another real shot without paying
+  // full reconnect overhead again.
+  private static final int MAX_MEASUREMENT_ATTEMPTS = 2;
+  // Must exceed CONNECT_TIMEOUT + MAX_MEASUREMENT_ATTEMPTS * (WRITE_TIMEOUT + MEASUREMENT_WAIT)
+  // with real margin, since that's the worst-case serial duration of a single pollOne() call.
+  private static final Duration BATCH_TIMEOUT = Duration.ofSeconds(70);
 
   private final BleTransport transport;
   private final ClassSession session;
@@ -65,28 +86,68 @@ public final class BandPoller {
   }
 
   private void pollOne(BandAssignment assignment) {
-    try (BandConnection connection =
-        transport.connect(assignment.device()).get(CONNECT_TIMEOUT.toSeconds(), TimeUnit.SECONDS)) {
-      CountDownLatch readingReceived = new CountDownLatch(1);
+    String address = assignment.device().address();
+    LOG.log(Level.INFO, "Connecting to {0} ({1})", address, assignment.studentId());
+    BandConnection connection;
+    try {
+      connection =
+          transport.connect(assignment.device()).get(CONNECT_TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      return;
+    } catch (Exception e) {
+      LOG.log(Level.WARNING, "Could not connect to " + address, e);
+      return;
+    }
+
+    try (connection) {
+      // One subscription for the whole connection: a late frame from an earlier attempt still
+      // counts down whichever latch is currently active, so a delayed-not-dropped notification
+      // is still recognized as success instead of silently discarded between attempts.
+      AtomicReference<CountDownLatch> currentLatch = new AtomicReference<>(new CountDownLatch(1));
       connection
           .notifications()
           .subscribe(
               new FrameSubscriber(
                   raw -> {
-                    if (FrameParser.parse(raw) instanceof Frame.HeartRate hr) {
+                    Frame frame = FrameParser.parse(raw);
+                    if (frame instanceof Frame.HeartRate hr) {
+                      LOG.log(Level.INFO, "HR frame from {0}: {1}", address, hr.bpm());
                       session.recordReading(assignment.studentId(), hr.bpm());
-                      readingReceived.countDown();
+                      currentLatch.get().countDown();
+                    } else if (frame instanceof Frame.Ack) {
+                      LOG.log(Level.DEBUG, "ACK from {0}", address);
                     }
                   }));
-      connection
-          .writeCommand(LaxasfitProtocol.withCrc(LaxasfitProtocol.CMD_HR_START))
-          .get(CONNECT_TIMEOUT.toSeconds(), TimeUnit.SECONDS);
-      readingReceived.await(MEASUREMENT_WAIT.toSeconds(), TimeUnit.SECONDS);
+
+      for (int attempt = 1; attempt <= MAX_MEASUREMENT_ATTEMPTS; attempt++) {
+        CountDownLatch latch = new CountDownLatch(1);
+        currentLatch.set(latch);
+        try {
+          connection
+              .writeCommand(LaxasfitProtocol.withCrc(LaxasfitProtocol.CMD_HR_START))
+              .get(WRITE_TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          return;
+        } catch (Exception e) {
+          LOG.log(Level.WARNING, "Could not write HR-start command to " + address, e);
+          return;
+        }
+
+        if (latch.await(MEASUREMENT_WAIT.toSeconds(), TimeUnit.SECONDS)) {
+          return;
+        }
+        LOG.log(
+            Level.WARNING,
+            "No HR frame from {0} within {1}s (attempt {2}/{3})",
+            address,
+            MEASUREMENT_WAIT.toSeconds(),
+            attempt,
+            MAX_MEASUREMENT_ATTEMPTS);
+      }
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
-    } catch (Exception e) {
-      // Soft failure: the band's own display already shows the reading;
-      // a dropped link here just means this cycle has no logged sample.
     }
   }
 

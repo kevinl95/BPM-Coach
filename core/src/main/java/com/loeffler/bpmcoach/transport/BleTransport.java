@@ -15,4 +15,12 @@ public interface BleTransport {
 
   /** Connects to a discovered device, requesting a high-priority/tight connection interval. */
   CompletableFuture<BandConnection> connect(DiscoveredDevice device);
+
+  /**
+   * Best-effort cleanup for any connections still open when the app is shutting down abruptly (e.g.
+   * Ctrl+C/SIGINT, which bypasses the normal per-connection {@code try}-with-resources close).
+   * No-op by default; real transports with OS-level connection state should override this to avoid
+   * leaving a BLE link stuck open after the process is gone.
+   */
+  default void shutdown() {}
 }

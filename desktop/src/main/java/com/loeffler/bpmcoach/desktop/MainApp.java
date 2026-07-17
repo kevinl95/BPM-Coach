@@ -18,6 +18,7 @@ import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import javafx.application.Application;
 import javafx.scene.Scene;
 import javafx.scene.control.Tab;
@@ -25,10 +26,10 @@ import javafx.scene.control.TabPane;
 import javafx.stage.Stage;
 
 /**
- * Entry point. {@code --mode=live} uses {@link SimpleBleTransport} (real bands); anything else (the
- * default) uses {@link MockBleTransport}, so the app - including pairing - is demoable with only 2
- * physical bands on hand. Both transports drive the identical {@link ClassSession}/{@link
- * BandPoller} pipeline.
+ * Entry point. Defaults to {@link SimpleBleTransport} (real bands) - that's how the app is actually
+ * used. Pass {@code --mode=demo} to use {@link MockBleTransport} instead, so the app - including
+ * pairing - is demoable with only 2 physical bands on hand, or none at all. Both transports drive
+ * the identical {@link ClassSession}/{@link BandPoller} pipeline.
  *
  * <p>The roster (student names and their paired band addresses) is loaded from {@link RosterStore}
  * at startup and written back on every pairing change, so a band paired in a previous session is
@@ -39,12 +40,19 @@ public final class MainApp extends Application {
 
   private static final int DEMO_BAND_COUNT = 8;
   private static final long EMPTY_ROSTER_POLL_DELAY_SECONDS = 2;
+  // A round can return almost instantly if every band fails fast (e.g. not yet seen by
+  // BandDiscovery's scan this session: SimpleBleTransport.connect() rejects an undiscovered
+  // address immediately, it doesn't wait out the connect timeout). Without a floor, that turns
+  // into a tight CPU-spinning retry loop instead of just waiting for the next scan cycle to
+  // possibly find the band.
+  private static final long MIN_ROUND_INTERVAL_SECONDS = 5;
 
   private ClassSession session;
   private BleTransport transport;
   private BandDiscovery discovery;
   private RosterStore rosterStore;
   private ExecutorService pollingExecutor;
+  private final AtomicBoolean cleanedUp = new AtomicBoolean();
 
   public static void main(String[] args) {
     launch(args);
@@ -52,14 +60,20 @@ public final class MainApp extends Application {
 
   @Override
   public void init() {
-    boolean live = getParameters().getUnnamed().contains("--mode=live");
+    boolean demo = getParameters().getUnnamed().contains("--mode=demo");
 
     rosterStore = new RosterStore(RosterStore.defaultLocation());
     List<Student> savedRoster = rosterStore.load();
     session = new ClassSession(savedRoster, ZoneConfig.DEFAULT);
 
-    transport = live ? new SimpleBleTransport() : new MockBleTransport(DEMO_BAND_COUNT);
+    transport = demo ? new MockBleTransport(DEMO_BAND_COUNT) : new SimpleBleTransport();
     discovery = new BandDiscovery(transport);
+
+    // Ctrl+C/SIGINT kills the JVM without going through JavaFX's normal stop() lifecycle, which
+    // otherwise skips transport.shutdown() entirely - confirmed against real hardware, that
+    // leaves a band connected at the OS/BlueZ level with no process left to disconnect it, so the
+    // *next* launch's scan finds nothing at all. A shutdown hook runs on both paths.
+    Runtime.getRuntime().addShutdownHook(new Thread(this::cleanup, "bpm-coach-cleanup"));
   }
 
   @Override
@@ -100,6 +114,7 @@ public final class MainApp extends Application {
               }
               continue;
             }
+            long roundStart = System.nanoTime();
             for (List<BandAssignment> batch : BandPoller.batch(assignments)) {
               if (Thread.currentThread().isInterrupted()) {
                 return;
@@ -110,6 +125,11 @@ public final class MainApp extends Application {
                 Thread.currentThread().interrupt();
                 return;
               }
+            }
+            long elapsedSeconds = (System.nanoTime() - roundStart) / 1_000_000_000L;
+            long remaining = MIN_ROUND_INTERVAL_SECONDS - elapsedSeconds;
+            if (remaining > 0 && !sleepQuietly(remaining)) {
+              return;
             }
           }
         });
@@ -128,10 +148,19 @@ public final class MainApp extends Application {
 
   @Override
   public void stop() {
+    cleanup();
+  }
+
+  /** Idempotent: reachable both from the normal stop() lifecycle and the shutdown hook. */
+  private void cleanup() {
+    if (!cleanedUp.compareAndSet(false, true)) {
+      return;
+    }
     discovery.stop();
     if (pollingExecutor != null) {
       pollingExecutor.shutdownNow();
     }
+    transport.shutdown();
     session.close();
   }
 }

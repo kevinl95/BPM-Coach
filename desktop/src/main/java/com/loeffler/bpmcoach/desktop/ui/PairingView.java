@@ -70,8 +70,17 @@ public final class PairingView extends SplitPane {
               public void onNext(DiscoveredDevice device) {
                 Platform.runLater(
                     () -> {
-                      discoveredList.getItems().removeIf(d -> d.address().equals(device.address()));
-                      discoveredList.getItems().add(device);
+                      // Update in place if already listed, so a re-discovered band (this fires
+                      // on every scan cycle, every ~6s) refreshes its rssi/name without jumping
+                      // to the end of the list and losing the user's place mid-selection.
+                      List<DiscoveredDevice> items = discoveredList.getItems();
+                      for (int i = 0; i < items.size(); i++) {
+                        if (items.get(i).address().equals(device.address())) {
+                          items.set(i, device);
+                          return;
+                        }
+                      }
+                      items.add(device);
                     });
               }
 
@@ -177,9 +186,9 @@ public final class PairingView extends SplitPane {
       status.setText("Select a paired student first.");
       return;
     }
-    session.upsertStudent(new Student(selected.id(), selected.name(), null));
+    session.removeStudent(selected.id());
     rosterStore.save(session.roster());
-    status.setText("Unpaired " + selected.name() + ".");
+    status.setText("Removed " + selected.name() + ".");
   }
 
   private void refreshPairedList() {

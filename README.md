@@ -60,8 +60,8 @@ continuously in the background for as long as the app runs - so a
 previously-paired band is recognized (and starts being polled) as soon as
 it's back in range, with no re-pairing needed. Typing an existing student's
 name re-points their pairing at the newly selected band instead of creating a
-duplicate; **Unpair** clears a student's band without removing them from the
-roster. This works identically in demo mode against `MockBleTransport`'s
+duplicate; **Unpair** removes the selected student from the roster entirely.
+This works identically in demo mode against `MockBleTransport`'s
 simulated bands, which is also the easiest way to see the whole flow with no
 hardware: pair a few "Mock Band N" entries and watch them show up on the
 Projector tab.
@@ -117,16 +117,55 @@ the real Java 26 toolchain via [Foojay](https://github.com/gradle/foojay-toolcha
 on first run).
 
 ```bash
-# Demo mode (default) - simulated bands, no hardware required
+# Live mode (default) - real bands via SimpleJavaBLE. This is how the app
+# is actually meant to run; it needs a Bluetooth adapter.
 ./gradlew :desktop:run
 
-# Live mode - real bands via SimpleJavaBLE
-./gradlew :desktop:run --args=--mode=live
+# Demo mode - simulated bands, no hardware required. Use this for judging,
+# for a demo without bands on hand, or if this machine has no Bluetooth.
+./gradlew :desktop:run --args=--mode=demo
 ```
 
 First launch starts with an empty roster in both modes - use the **Pairing**
 tab to scan and assign names to bands (see "Pairing bands" above). Pairings
 persist across launches automatically.
+
+### Troubleshooting a paired band that shows no data
+
+`BandPoller` logs each stage of polling a real band (connect, HR-start write,
+whether a reading arrived) via `java.lang.System.Logger`, which prints to the
+console by default with no extra setup - watch for `WARNING` lines when
+`./gradlew :desktop:run` is running. A `Could not connect` or `Could not
+write` warning points to the BLE link itself. A `No HR frame from <address>
+within 15s (attempt N/2)` means the connection and command write both
+succeeded but no result came back in time - `BandPoller` retries the HR-start
+command once more on the same still-open connection before giving up, since
+cheap BLE bands can genuinely drop a notification (not just delay it) under
+their own aggressive low-power connection interval; if you see the band's own
+screen show a reading that never shows up here even after both attempts,
+that's this dropped-notification behavior, a hardware/radio characteristic
+rather than an app bug.
+
+### Band not showing up at all (not even in a raw OS-level scan)
+
+If `BandDiscovery`'s scan cycles keep reporting the band's address as not
+found, and a raw `bluetoothctl scan on` (interactive mode - see below) can't
+see it either, the band itself has stopped advertising - no code change fixes
+that, since nothing can connect to a device that isn't broadcasting. This
+showed up after this band had been through a lot of rapid connect/disconnect
+cycling during development. Fix: reset the band itself, from its own on-device
+menu - **scroll to MORE, then scroll to RESET**. After resetting, confirm it's
+advertising again before relaunching the app:
+
+```bash
+bluetoothctl        # interactive mode - a plain `bluetoothctl scan on` in a
+                     # non-interactive shell returns immediately and doesn't
+                     # stream results
+scan on
+# watch for "[NEW] Device <address> B01H_M4" (or your band's address/name)
+scan off
+exit
+```
 
 ## Packaging
 
@@ -141,6 +180,11 @@ built on that OS:
 
 produces a `.deb`/`.rpm` on Linux, `.msi`/`.exe` on Windows, `.pkg`/`.dmg` on
 macOS, in `desktop/build/jlinkbase/jlinkjars` / `desktop/build/jpackage`.
+
+The installed app defaults to live mode, same as running from source - there's
+no separate packaging-time override needed. A double-clicked icon has no way
+to pass `--mode=demo`, but that's the point: the shipped product should assume
+real hardware unless told otherwise.
 
 ## Testing
 

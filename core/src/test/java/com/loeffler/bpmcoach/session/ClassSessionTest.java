@@ -58,6 +58,33 @@ class ClassSessionTest {
   }
 
   @Test
+  void removeStudentDeletesThemFromTheRosterEntirely() {
+    ClassSession session =
+        new ClassSession(
+            List.of(new Student("emma", "Emma", "AA:BB:CC:01"), new Student("liam", "Liam", null)),
+            ZoneConfig.DEFAULT);
+
+    session.removeStudent("emma");
+
+    assertEquals(1, session.roster().size());
+    assertEquals("liam", session.roster().get(0).id());
+    assertTrue(session.assignments().isEmpty());
+    assertTrue(
+        session.currentSnapshot().statuses().stream()
+            .noneMatch(s -> s.student().id().equals("emma")));
+  }
+
+  @Test
+  void removeStudentIsANoOpForAnUnknownId() {
+    ClassSession session =
+        new ClassSession(List.of(new Student("emma", "Emma", "AA:BB:CC:01")), ZoneConfig.DEFAULT);
+
+    session.removeStudent("does-not-exist");
+
+    assertEquals(1, session.roster().size());
+  }
+
+  @Test
   void upsertPreservesLatestReadingWhenOnlyTheBandChanges() {
     ClassSession session =
         new ClassSession(List.of(new Student("emma", "Emma", "AA:BB:CC:01")), ZoneConfig.DEFAULT);
