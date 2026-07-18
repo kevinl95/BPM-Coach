@@ -2,6 +2,7 @@ package com.loeffler.bpmcoach.session;
 
 import com.loeffler.bpmcoach.protocol.Frame;
 import com.loeffler.bpmcoach.protocol.FrameParser;
+import com.loeffler.bpmcoach.protocol.FrameReassembler;
 import com.loeffler.bpmcoach.protocol.LaxasfitProtocol;
 import com.loeffler.bpmcoach.transport.BandConnection;
 import com.loeffler.bpmcoach.transport.BleTransport;
@@ -13,6 +14,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Flow;
 import java.util.concurrent.StructuredTaskScope;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
@@ -38,6 +40,13 @@ public final class BandPoller {
   // beyond that, since a slow/laggy BLE connection interval can delay notification delivery
   // even after the band has actually finished measuring.
   private static final Duration MEASUREMENT_WAIT = Duration.ofSeconds(15);
+  // A HeartRate frame with a present bpm arriving faster than this is treated as suspicious
+  // rather than final - the payload's own date/record-count/timestamp fields (see
+  // LaxasfitProtocol's parseHeartRate javadoc) look like stored-record metadata, and a genuine
+  // live measurement is documented to take ~8-10s, so anything much faster than that is more
+  // likely an immediate history-sync push than the live result. Set safely below the documented
+  // minimum so a real fast reading is never discarded.
+  public static final Duration MIN_LIVE_READING_DELAY = Duration.ofSeconds(5);
   // Confirmed against real hardware: the band's cheap radio negotiates an aggressive low-power
   // connection interval (no requestConnectionPriority equivalent exists in this BLE binding to
   // fix that, unlike the Android reference client), so a notification can be genuinely dropped
@@ -104,19 +113,22 @@ public final class BandPoller {
       // One subscription for the whole connection: a late frame from an earlier attempt still
       // counts down whichever latch is currently active, so a delayed-not-dropped notification
       // is still recognized as success instead of silently discarded between attempts.
+      FrameReassembler reassembler = new FrameReassembler();
       AtomicReference<CountDownLatch> currentLatch = new AtomicReference<>(new CountDownLatch(1));
+      AtomicLong attemptWriteCompletedNanos = new AtomicLong(System.nanoTime());
       connection
           .notifications()
           .subscribe(
               new FrameSubscriber(
                   raw -> {
-                    Frame frame = FrameParser.parse(raw);
-                    if (frame instanceof Frame.HeartRate hr) {
-                      LOG.log(Level.INFO, "HR frame from {0}: {1}", address, hr.bpm());
-                      session.recordReading(assignment.studentId(), hr.bpm());
-                      currentLatch.get().countDown();
-                    } else if (frame instanceof Frame.Ack) {
-                      LOG.log(Level.DEBUG, "ACK from {0}", address);
+                    for (byte[] complete : reassembler.accept(raw)) {
+                      handleCompleteFrame(
+                          address,
+                          assignment,
+                          complete,
+                          connection,
+                          currentLatch,
+                          attemptWriteCompletedNanos);
                     }
                   }));
 
@@ -127,6 +139,7 @@ public final class BandPoller {
           connection
               .writeCommand(LaxasfitProtocol.withCrc(LaxasfitProtocol.CMD_HR_START))
               .get(WRITE_TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+          attemptWriteCompletedNanos.set(System.nanoTime());
         } catch (InterruptedException e) {
           Thread.currentThread().interrupt();
           return;
@@ -148,6 +161,80 @@ public final class BandPoller {
       }
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
+    }
+  }
+
+  private void handleCompleteFrame(
+      String address,
+      BandAssignment assignment,
+      byte[] complete,
+      BandConnection connection,
+      AtomicReference<CountDownLatch> currentLatch,
+      AtomicLong attemptWriteCompletedNanos) {
+    Frame frame = FrameParser.parse(complete);
+    LOG.log(
+        Level.INFO,
+        "Notification from {0}: {1} [{2}]",
+        address,
+        frame.getClass().getSimpleName(),
+        LaxasfitProtocol.hex(complete));
+    if (!LaxasfitProtocol.crcValid(complete)) {
+      // Diagnostic only - LaxasfitProtocol itself deliberately doesn't enforce this (see its
+      // javadoc), and that stays untouched; a mismatch here on an already-reassembled,
+      // correctly-sized frame is still worth knowing about if it ever happens.
+      LOG.log(
+          Level.WARNING,
+          "CRC mismatch on reassembled frame from {0}: [{1}]",
+          address,
+          LaxasfitProtocol.hex(complete));
+    }
+    if (!(frame instanceof Frame.HeartRate hr)) {
+      return;
+    }
+
+    // The documented exchange (Gadgetbridge issue #5640) is START -> band ACK -> DATA -> host
+    // ACK: the host is expected to acknowledge every DATA_HR frame it receives, regardless of
+    // whether the reading is empty, stale-looking, or good. An unacknowledged record can leave
+    // the band waiting on a host it now considers unresponsive - which matches this app's own
+    // observed real-hardware pattern: one successful reading, then silence afterward.
+    ackHrData(connection, address);
+
+    if (hr.bpm().isEmpty()) {
+      // A genuine "no reading" is still worth recording (history/audit value), but it's not a
+      // final answer - keep listening for the rest of this attempt's window instead of treating
+      // it as the result and moving on.
+      session.recordReading(assignment.studentId(), hr.bpm());
+      return;
+    }
+
+    long elapsedMillis = (System.nanoTime() - attemptWriteCompletedNanos.get()) / 1_000_000L;
+    if (elapsedMillis < MIN_LIVE_READING_DELAY.toMillis()) {
+      // Don't record this at all: we don't trust the value enough to show it, let alone end
+      // polling on it.
+      LOG.log(
+          Level.WARNING,
+          "Ignoring HR frame from {0} ({1}) only {2}ms after the write - too fast to be the live"
+              + " measurement, likely a stored-record push",
+          address,
+          hr.bpm(),
+          elapsedMillis);
+      return;
+    }
+
+    LOG.log(Level.INFO, "HR frame from {0}: {1}", address, hr.bpm());
+    session.recordReading(assignment.studentId(), hr.bpm());
+    currentLatch.get().countDown();
+  }
+
+  private void ackHrData(BandConnection connection, String address) {
+    try {
+      connection
+          .writeCommand(LaxasfitProtocol.withCrc(LaxasfitProtocol.CMD_HR_DATA_ACK))
+          .get(WRITE_TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+    } catch (Exception e) {
+      LOG.log(Level.WARNING, "Could not ack HR data to " + address, e);
     }
   }
 

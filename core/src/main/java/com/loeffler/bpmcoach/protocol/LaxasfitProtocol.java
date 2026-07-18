@@ -34,6 +34,14 @@ public final class LaxasfitProtocol {
   public static final byte[] CMD_HR_LAST = {
     (byte) 0xDF, 0x00, 0x06, 0x00, 0x05, 0x10, 0x06, 0x00, 0x01, 0x00
   };
+  // Host-side acknowledgement of a received DATA_HR frame, per the documented exchange in
+  // Gadgetbridge issue #5640 (the same capture our own reference 86bpm frame vector comes
+  // from): the vendor app always sends this back after a DATA_HR result, and every documented
+  // exchange follows START -> band ACK -> DATA -> host ACK. cmd triple is 05 04 00 (bytes 0
+  // and 2 of DATA_HR's own 05 01 04, per the doc), payload 00 01.
+  public static final byte[] CMD_HR_DATA_ACK = {
+    (byte) 0xFD, 0x00, 0x05, 0x00, 0x05, 0x04, 0x00, 0x00, 0x01
+  };
 
   private LaxasfitProtocol() {}
 

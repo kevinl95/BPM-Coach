@@ -58,7 +58,9 @@ class MockBleTransportTest {
         .writeCommand(LaxasfitProtocol.withCrc(LaxasfitProtocol.CMD_HR_START))
         .get(1, TimeUnit.SECONDS);
 
-    assertTrue(received.await(10, TimeUnit.SECONDS), "expected a heart-rate frame within 10s");
+    // MockBleTransport's simulated delay is calibrated to stay above
+    // BandPoller.MIN_LIVE_READING_DELAY (currently up to ~9s); leave real margin above that.
+    assertTrue(received.await(15, TimeUnit.SECONDS), "expected a heart-rate frame within 15s");
     assertTrue(lastFrame.get() instanceof Frame.HeartRate);
     connection.close();
   }

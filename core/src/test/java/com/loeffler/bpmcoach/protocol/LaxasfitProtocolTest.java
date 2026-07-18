@@ -43,6 +43,16 @@ class LaxasfitProtocolTest {
   }
 
   @Test
+  @DisplayName("CMD_HR_DATA_ACK matches the documented host-side data-ack frame once CRC'd")
+  void hrDataAckCommandCrc() {
+    // Gadgetbridge issue #5640's documented exchange: after DATA_HR, the host acks with this
+    // exact frame (fd 00 05 0c 05 04 00 00 01).
+    assertArrayEquals(
+        LaxasfitProtocol.hex("fd 00 05 0c 05 04 00 00 01"),
+        LaxasfitProtocol.withCrc(LaxasfitProtocol.CMD_HR_DATA_ACK));
+  }
+
+  @Test
   @DisplayName("reference HR frame parses to 86 bpm")
   void referenceHrFrameParses() {
     byte[] hrRef =
@@ -52,19 +62,23 @@ class LaxasfitProtocolTest {
   }
 
   @Test
-  @DisplayName("finger-not-seated HR frame parses to -1 (no reading)")
-  void emptyHrFrameParsesToNoReading() {
-    // This real capture's checksum does NOT self-validate under crc() (sum ==
-    // 0x17, frame carries 0x69) - confirmed against the original TestLaxasfit.java
-    // + LaxasfitProtocol.java unmodified, which also fails this one check (14/15,
-    // not the full pass count). This is exactly the real-world evidence behind
-    // parseHeartRate's documented decision not to enforce inbound CRC: some
-    // firmware variants compute it over a record-count-dependent window, so a
-    // whole-frame sum doesn't always match even on a genuine capture. What must
-    // still hold - and does - is that the frame parses correctly regardless.
-    byte[] hrEmpty =
+  @DisplayName("truncated HR frame (last byte missing) parses to -1 given only what arrived")
+  void truncatedHrFrameParsesToNoReadingGivenOnlyThePartialBytes() {
+    // This is NOT actually a finger-off/no-reading capture, despite how the original harness
+    // labeled it - it's a genuine 82 bpm reading, one byte short. The length prefix (bytes 1-2 =
+    // 0x0011 = 17) says the frame should be 17+4 = 21 bytes, same as every other DATA_HR capture,
+    // but this vector is only 20. Its checksum doesn't self-validate under crc() (sum == 0x17,
+    // frame carries 0x69) for exactly that reason: 0x69 - 0x17 = 0x52 = 82 (decimal), the missing
+    // trailing byte - append it and the CRC validates. See FrameReassemblerTest, which reconstructs
+    // this exact frame from a 20-byte chunk + the 1-byte tail and confirms it parses to 82 bpm.
+    //
+    // What's tested here is still correct and worth keeping: LaxasfitProtocol.parseHeartRate has
+    // no notion of frame boundaries, only "read the last byte of whatever you're given" - so
+    // handed exactly these 20 (incomplete) bytes on their own, -1 is the right answer. Reassembly
+    // is FrameReassembler's job, upstream of this call, not this ground-truth file's.
+    byte[] truncated =
         LaxasfitProtocol.hex("df 00 11 69 05 01 04 00 0c 28 23 00 01 00 00 7a 4b 00 00 00");
-    assertEquals(-1, LaxasfitProtocol.parseHeartRate(hrEmpty));
+    assertEquals(-1, LaxasfitProtocol.parseHeartRate(truncated));
   }
 
   @Test

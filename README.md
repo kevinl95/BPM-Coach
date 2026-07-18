@@ -132,19 +132,32 @@ persist across launches automatically.
 
 ### Troubleshooting a paired band that shows no data
 
-`BandPoller` logs each stage of polling a real band (connect, HR-start write,
-whether a reading arrived) via `java.lang.System.Logger`, which prints to the
-console by default with no extra setup - watch for `WARNING` lines when
-`./gradlew :desktop:run` is running. A `Could not connect` or `Could not
-write` warning points to the BLE link itself. A `No HR frame from <address>
-within 15s (attempt N/2)` means the connection and command write both
-succeeded but no result came back in time - `BandPoller` retries the HR-start
-command once more on the same still-open connection before giving up, since
-cheap BLE bands can genuinely drop a notification (not just delay it) under
-their own aggressive low-power connection interval; if you see the band's own
-screen show a reading that never shows up here even after both attempts,
-that's this dropped-notification behavior, a hardware/radio characteristic
-rather than an app bug.
+`BandPoller` logs every notification it receives (reassembled, with raw hex)
+plus each stage of polling a real band (connect, HR-start write, whether a
+reading arrived) via `java.lang.System.Logger`, which prints to the console
+by default with no extra setup - watch for `WARNING` lines when
+`./gradlew :desktop:run` is running.
+
+- `Could not connect` / `Could not write` points to the BLE link itself.
+- `Notification from <address>: HeartRate [<hex>]` with an empty bpm is a
+  genuine "no reading yet" - `BandPoller` keeps listening for the rest of
+  that attempt's window rather than giving up on it (a real live measurement
+  can still arrive after an earlier empty one).
+- `Ignoring HR frame from <address> (<bpm>) only <N>ms after the write` means
+  a present reading arrived faster than plausible for a real ~8-10s
+  measurement and was treated as a stored-record push, not the live result -
+  see the CRC-truncation note above for why that distinction matters.
+- `No HR frame from <address> within 15s (attempt N/2)` means the whole
+  window elapsed with nothing accepted - `BandPoller` retries the HR-start
+  command once more on the same still-open connection before giving up,
+  since cheap BLE bands can genuinely drop a notification (not just delay
+  it) under their own aggressive low-power connection interval. If the
+  band's own screen shows a reading that never shows up here even after both
+  attempts, that's this dropped-notification behavior, a hardware/radio
+  characteristic rather than an app bug.
+- `CRC mismatch on reassembled frame` on a frame that's otherwise the
+  correct, complete length is worth reporting - unlike the truncation case
+  above, this would be a genuine anomaly once reassembly is in place.
 
 ### Band not showing up at all (not even in a raw OS-level scan)
 
@@ -166,6 +179,42 @@ scan on
 scan off
 exit
 ```
+
+### One good reading, then silence
+
+If polling gets exactly one valid reading and then times out on every
+subsequent attempt (connect and write both keep succeeding, but no
+notification - not even the band's own ACK - ever comes back), this matches
+a specific gap in the protocol flow: per the documented exchange in
+Gadgetbridge issue #5640 (the same capture our reference 86bpm test vector
+comes from), the host is expected to acknowledge every `DATA_HR` frame it
+receives with a fixed reply (`LaxasfitProtocol.CMD_HR_DATA_ACK`). An
+unacknowledged record can leave the band waiting on a host it now considers
+unresponsive. `BandPoller` now sends this ack unconditionally for every
+`DATA_HR` frame (empty, stale-looking, or good) as soon as it's parsed -
+verified against the documented frame bytes and independently re-derived
+via `LaxasfitProtocol.crc()` before being added, not just copied in.
+
+Two related ideas surfaced during that investigation that are **not**
+implemented, since they couldn't be verified with the same confidence (and
+this app already got one clean reading through with neither of them in
+place, which argues against either being strictly required):
+
+- **Session initialization.** The vendor app and Gadgetbridge reportedly run
+  an init sequence (set date/time, request device info) before doing
+  anything else. Worth trying if the ack fix alone isn't enough.
+- **Periodic/timed auto-measurement.** If the band's vendor app exposes a
+  "measure every N minutes" setting, `CMD_HR_LAST` (already defined in
+  `LaxasfitProtocol`, currently unused) could read the band's own stored
+  result instantly instead of this app driving a ~10-15s remote-triggered
+  measurement per band per poll - a meaningfully better fit for polling a
+  whole classroom. Nobody's confirmed the enable-periodic-measurement
+  command bytes exist for this band family yet.
+
+(Credit: this whole thread - the missing ack, and the protocol citations
+above - came from a second AI reviewer, Fable, given the repo to review
+independently. Verified against the primary source and re-derived
+arithmetically before implementing, same as the frame-truncation finding.)
 
 ## Packaging
 
@@ -194,14 +243,29 @@ real hardware unless told otherwise.
 
 `core/src/test/java/.../protocol/LaxasfitProtocolTest.java` is a direct
 JUnit 5 port of the original manual verification harness, against the exact
-same hex frame vectors (spec reference frames plus real captures). One note
-from that port: the real finger-off/no-reading capture's own checksum does
-**not** self-validate under `crc()` - confirmed by running the original,
-unmodified harness - which is the actual empirical case behind
-`parseHeartRate`'s documented decision not to enforce inbound CRC (BLE
-already guarantees link integrity; some firmware variants compute the
-inbound checksum over a different window). What still holds, and is what's
-tested, is that the frame parses correctly regardless.
+same hex frame vectors (spec reference frames plus real captures).
+
+**Correction, found during real-hardware debugging:** the vector originally
+labeled "finger-not-seated" in that harness is not a no-reading capture at
+all - it's a genuine 82 bpm reading, truncated by exactly one byte. Its
+length prefix says 21 bytes; it's 20. Its CRC "failure" reconciles exactly
+once the missing trailing byte (0x52 = 82 decimal) is accounted for. This
+matters beyond the test suite: BLE notifications are capped by the ATT MTU
+(20 bytes of payload at the common default), so a 21-byte protocol frame
+arrives as two separate notifications, and every live reading was silently
+landing on the truncated first chunk - always reading a zeroed pad byte as
+"no reading," regardless of the band's actual measurement. `FrameReassembler`
+now buffers notification bytes per connection and uses the frame's own
+length prefix to emit only complete frames to `FrameParser`; `BandPoller`
+also no longer accepts an empty reading as final within an attempt (it keeps
+listening for the rest of the window instead) and rejects any present
+reading arriving suspiciously fast after the write, on the theory that a
+frame shaped like a stored-record push (it carries date/record-count/
+timestamp fields, see `parseHeartRate`'s javadoc) isn't the live measurement.
+See `FrameReassemblerTest` for the reconstruction proof, and
+`core/src/main/java/.../protocol/FrameReassembler.java`'s javadoc for the
+full account. (Credit: found by a second AI reviewer - Fable - given the repo
+to review independently; verified here by hand before acting on it.)
 
 ## License
 

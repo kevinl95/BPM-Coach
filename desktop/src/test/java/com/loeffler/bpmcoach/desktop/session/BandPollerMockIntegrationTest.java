@@ -1,6 +1,6 @@
 package com.loeffler.bpmcoach.desktop.session;
 
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 
 import com.loeffler.bpmcoach.desktop.transport.MockBleTransport;
 import com.loeffler.bpmcoach.domain.Student;
@@ -8,7 +8,6 @@ import com.loeffler.bpmcoach.domain.ZoneConfig;
 import com.loeffler.bpmcoach.session.BandAssignment;
 import com.loeffler.bpmcoach.session.BandPoller;
 import com.loeffler.bpmcoach.session.ClassSession;
-import com.loeffler.bpmcoach.session.StudentStatus;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 
@@ -32,10 +31,13 @@ class BandPollerMockIntegrationTest {
     List<BandAssignment> assignments = session.assignments();
     poller.pollBatch(assignments);
 
-    StudentStatus status = session.currentSnapshot().statuses().get(0);
-    assertTrue(
-        status.lastUpdate() != null,
-        "expected a reading (value or explicit no-reading) to have been recorded");
+    // Recorded to history regardless of whether the reading came back present or empty
+    // (MockBleTransport has a small chance of simulating "no reading this cycle" too) - a
+    // present-vs-empty reading no longer implies anything about session.currentSnapshot()'s
+    // `latest`, since an empty reading deliberately leaves that untouched.
+    assertFalse(
+        session.historyFor(assignments.get(0).studentId()).isEmpty(),
+        "expected at least one reading (value or explicit no-reading) to have been recorded");
     session.close();
   }
 }

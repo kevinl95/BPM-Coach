@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.loeffler.bpmcoach.domain.Student;
+import com.loeffler.bpmcoach.domain.Zone;
 import com.loeffler.bpmcoach.domain.ZoneConfig;
 import java.util.List;
 import org.junit.jupiter.api.Test;
@@ -94,5 +95,29 @@ class ClassSessionTest {
 
     StudentStatus status = session.currentSnapshot().statuses().get(0);
     assertEquals(java.util.OptionalInt.of(130), status.bpm());
+  }
+
+  @Test
+  void aNoReadingCycleDoesNotBlankAPreviousGoodReading() {
+    ClassSession session =
+        new ClassSession(List.of(new Student("emma", "Emma", "AA:BB:CC:01")), ZoneConfig.DEFAULT);
+    session.recordReading("emma", java.util.OptionalInt.of(82));
+
+    session.recordReading("emma", java.util.OptionalInt.empty());
+
+    StudentStatus status = session.currentSnapshot().statuses().get(0);
+    assertEquals(java.util.OptionalInt.of(82), status.bpm());
+    assertEquals(Zone.LOW, status.zone());
+  }
+
+  @Test
+  void aNoReadingCycleIsStillRecordedInHistory() {
+    ClassSession session =
+        new ClassSession(List.of(new Student("emma", "Emma", "AA:BB:CC:01")), ZoneConfig.DEFAULT);
+
+    session.recordReading("emma", java.util.OptionalInt.empty());
+
+    assertEquals(1, session.historyFor("emma").size());
+    assertTrue(session.historyFor("emma").get(0).bpm().isEmpty());
   }
 }

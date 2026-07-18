@@ -56,13 +56,20 @@ public final class ClassSession implements AutoCloseable {
       return; // unassigned/unknown band; ignore
     }
     Instant now = Instant.now();
-    Zone zone = zoneConfig.get().classify(bpm);
-    latest.put(studentId, new StudentStatus(student, bpm, zone, now));
 
     var deque = history.computeIfAbsent(studentId, id -> new ConcurrentLinkedDeque<>());
     deque.addLast(new HeartRateReading(studentId, bpm, now));
     while (deque.size() > HISTORY_LIMIT_PER_STUDENT) {
       deque.pollFirst();
+    }
+
+    // A "no reading this cycle" shouldn't blank a tile back to unknown: leave the last known
+    // good status on screen rather than flickering it every time one poll comes up empty (a
+    // transient miss - dropped notification, band momentarily off-wrist - is common and doesn't
+    // mean the previous reading is stale).
+    if (bpm.isPresent()) {
+      Zone zone = zoneConfig.get().classify(bpm);
+      latest.put(studentId, new StudentStatus(student, bpm, zone, now));
     }
 
     publisher.submit(currentSnapshot());

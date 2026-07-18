@@ -1,7 +1,65 @@
+/*
+ * A dark theme applied deliberately, not just via .root: JavaFX controls (TabPane's
+ * tab-header-area, ListView, Button, TextField, Spinner, SplitPane's divider) ship their own
+ * default styling from the built-in Modena stylesheet and don't inherit from .root's background,
+ * so each needs its own override or it's left showing the default light theme against a dark
+ * app - which is exactly what was happening to the tab bar.
+ */
+
 .root {
     -fx-font-family: "Segoe UI", "Helvetica Neue", sans-serif;
     -fx-background-color: #1b1d23;
+    -fx-base: #1b1d23;
+    -fx-accent: #5b8def;
 }
+
+/* ---- Shared surface palette ---- */
+/* -fx-surface: cards/inputs, one step lighter than the page background.
+   -fx-border:  hairlines against that surface.
+   -fx-text-muted: secondary/label text. */
+* {
+    -fx-surface: #262933;
+    -fx-border-subtle: #3a3d47;
+    -fx-text-muted: #b8bcc8;
+}
+
+/* ---- TabPane (the projector/history/pairing/zone-config navigation) ---- */
+
+.tab-pane {
+    -fx-background-color: #1b1d23;
+}
+.tab-pane .tab-header-area {
+    -fx-background-color: #14151a;
+    -fx-padding: 6 8 0 8;
+}
+.tab-pane .tab-header-background {
+    -fx-background-color: #14151a;
+}
+.tab-pane .tab {
+    -fx-background-color: #262933;
+    -fx-background-radius: 6 6 0 0;
+    -fx-padding: 8 18 8 18;
+}
+.tab-pane .tab:selected {
+    -fx-background-color: #1b1d23;
+}
+.tab-pane .tab-label {
+    -fx-text-fill: #b8bcc8;
+    -fx-font-size: 14px;
+}
+.tab-pane .tab:selected .tab-label {
+    -fx-text-fill: #ffffff;
+    -fx-font-weight: bold;
+}
+.tab-pane .tab-content-area {
+    -fx-background-color: #1b1d23;
+}
+.tab-pane .tab-header-area .tab-down-button,
+.tab-pane .headers-region {
+    -fx-background-color: transparent;
+}
+
+/* ---- Views ---- */
 
 .projector-view {
     -fx-padding: 24;
@@ -62,4 +120,89 @@
 .history-view .label, .zone-config-view .label, .pairing-view .label {
     -fx-text-fill: #e6e6e6;
     -fx-font-size: 14px;
+}
+
+/* ---- Controls used across History / Pairing / Zone Config ---- */
+
+.button {
+    -fx-background-color: #2f3542;
+    -fx-text-fill: #f0f1f5;
+    -fx-background-radius: 6;
+    -fx-border-color: #3a3d47;
+    -fx-border-radius: 6;
+    -fx-padding: 6 16 6 16;
+}
+.button:hover {
+    -fx-background-color: #3a3f4d;
+}
+.button:pressed, .button:default:pressed {
+    -fx-background-color: #5b8def;
+    -fx-text-fill: #0b0d12;
+}
+.button:default {
+    -fx-background-color: #5b8def;
+    -fx-text-fill: #0b0d12;
+}
+.button:default:hover {
+    -fx-background-color: #7ba3f2;
+}
+
+.text-field, .spinner .text-field {
+    -fx-background-color: #262933;
+    -fx-text-fill: #f0f1f5;
+    -fx-prompt-text-fill: #7d818f;
+    -fx-background-radius: 6;
+    -fx-border-color: #3a3d47;
+    -fx-border-radius: 6;
+    -fx-highlight-fill: #5b8def;
+    -fx-highlight-text-fill: #0b0d12;
+}
+
+.spinner {
+    -fx-background-color: transparent;
+}
+.spinner .increment-arrow-button, .spinner .decrement-arrow-button {
+    -fx-background-color: #2f3542;
+}
+.spinner .increment-arrow, .spinner .decrement-arrow {
+    -fx-background-color: #e6e6e6;
+}
+
+.list-view {
+    -fx-background-color: #262933;
+    -fx-border-color: #3a3d47;
+    -fx-border-radius: 6;
+    -fx-background-radius: 6;
+}
+.list-cell {
+    -fx-background-color: transparent;
+    -fx-text-fill: #e6e6e6;
+    -fx-padding: 6 10 6 10;
+}
+.list-cell:filled:hover {
+    -fx-background-color: #2f3542;
+}
+.list-cell:filled:selected {
+    -fx-background-color: #5b8def;
+    -fx-text-fill: #0b0d12;
+}
+
+.split-pane {
+    -fx-background-color: #1b1d23;
+    -fx-padding: 0;
+}
+.split-pane-divider {
+    -fx-background-color: #3a3d47;
+    -fx-padding: 0 1 0 1;
+}
+
+.scroll-bar {
+    -fx-background-color: #1b1d23;
+}
+.scroll-bar .thumb {
+    -fx-background-color: #3a3d47;
+    -fx-background-radius: 6;
+}
+.scroll-bar .track {
+    -fx-background-color: transparent;
 }

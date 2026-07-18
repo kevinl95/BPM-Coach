@@ -1,6 +1,7 @@
 package com.loeffler.bpmcoach.desktop.transport;
 
 import com.loeffler.bpmcoach.protocol.LaxasfitProtocol;
+import com.loeffler.bpmcoach.session.BandPoller;
 import com.loeffler.bpmcoach.transport.BandConnection;
 import com.loeffler.bpmcoach.transport.BleTransport;
 import com.loeffler.bpmcoach.transport.DiscoveredDevice;
@@ -120,11 +121,13 @@ public final class MockBleTransport implements BleTransport {
     }
 
     private void scheduleReading() {
+      // Must stay above BandPoller.MIN_LIVE_READING_DELAY, or a legitimate mock reading would
+      // get rejected by the same "too fast to be real" guard that's there to catch a
+      // stored-record push on actual hardware - mock and real must clear the same bar.
+      int lowerBoundMillis = (int) BandPoller.MIN_LIVE_READING_DELAY.toMillis() + 1000;
       Thread.startVirtualThread(
           () -> {
-            sleep(
-                ThreadLocalRandom.current()
-                    .nextInt(3000, 6000)); // mimics the real ~8-10s measurement window
+            sleep(ThreadLocalRandom.current().nextInt(lowerBoundMillis, lowerBoundMillis + 3000));
             int bpm;
             if (ThreadLocalRandom.current().nextDouble() < FINGER_OFF_PROBABILITY) {
               bpm = 0; // "no reading this cycle", same sentinel the real band sends
@@ -138,12 +141,14 @@ public final class MockBleTransport implements BleTransport {
     }
 
     private static byte[] heartRateFrame(int bpm) {
-      // Only what FrameParser actually reads matters: msg type, cmd id (DATA_HR),
-      // and the final payload byte. Length/CRC/date-time padding bytes are
-      // irrelevant to parsing (see LaxasfitProtocol.parseHeartRate) so they're
-      // left zeroed rather than faked.
+      // The length prefix (bytes 1-2, big-endian) DOES matter now: FrameReassembler needs it to
+      // know where this frame ends. CRC/date-time padding bytes still don't matter to parsing
+      // (see LaxasfitProtocol.parseHeartRate) so those stay zeroed.
       byte[] frame = new byte[21];
       frame[0] = LaxasfitProtocol.MSG_DATA;
+      int len = frame.length - 4;
+      frame[1] = (byte) ((len >> 8) & 0xFF);
+      frame[2] = (byte) (len & 0xFF);
       frame[4] = (byte) ((LaxasfitProtocol.DATA_HR >> 16) & 0xFF);
       frame[5] = (byte) ((LaxasfitProtocol.DATA_HR >> 8) & 0xFF);
       frame[6] = (byte) (LaxasfitProtocol.DATA_HR & 0xFF);
