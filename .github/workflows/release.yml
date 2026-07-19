@@ -58,7 +58,10 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         working-directory: desktop/build/jpackage
-        run: zip -r "../../../${{ matrix.asset-name }}.zip" bpm-coach
+        # Glob, not the literal name: jpackage's app-image output is a plain `bpm-coach` folder
+        # on Linux, but a `bpm-coach.app` bundle on macOS - confirmed on real CI, the literal
+        # name matched nothing there. Nothing else lives in this directory to false-match.
+        run: zip -r "../../../${{ matrix.asset-name }}.zip" bpm-coach*
 
       - name: Zip app-image (Windows)
         if: runner.os == 'Windows'
