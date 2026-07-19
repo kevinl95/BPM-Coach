@@ -2,7 +2,7 @@
 junit = "6.1.2"
 javafxVersion = "26.0.1"
 javafx-plugin = "0.1.0"
-jlink-plugin = "4.0.2"
+runtime-plugin = "2.0.1"
 spotless-plugin = "8.8.0"
 google-java-format = "1.35.0"
 
@@ -11,5 +11,5 @@ junit-jupiter = { module = "org.junit.jupiter:junit-jupiter", version.ref = "jun
 
 [plugins]
 javafx = { id = "org.openjfx.javafxplugin", version.ref = "javafx-plugin" }
-jlink = { id = "org.beryx.jlink", version.ref = "jlink-plugin" }
+runtime = { id = "org.beryx.runtime", version.ref = "runtime-plugin" }
 spotless = { id = "com.diffplug.spotless", version.ref = "spotless-plugin" }

@@ -27,10 +27,12 @@ under the **Business Source License 1.1 (BUSL-1.1)**:
 
 Full license text: <https://github.com/simpleble/simpleble/blob/main/LICENSE.md>
 
-The `simplejavable-1.0.0.jar` and per-OS native libraries vendored under
-`desktop/libs/` and `desktop/src/main/resources/native/` are unmodified
-binaries from SimpleBLE's [v1.0.0 release](https://github.com/simpleble/simpleble/releases/tag/v1.0.0),
-vendored here because SimpleJavaBLE is not published to Maven Central.
+The `simplejavable-1.0.0.jar` vendored under `desktop/libs/` is an unmodified
+binary from SimpleBLE's [v1.0.0 release](https://github.com/simpleble/simpleble/releases/tag/v1.0.0),
+vendored here because SimpleJavaBLE is not published to Maven Central. The
+jar bundles its own per-architecture native libraries internally (under
+`native/x64/` and `native/aarch64/`, extracted at runtime by its own
+`NativeLibraryLoader`) - nothing else needs to be vendored separately.
 
 ## BPM Coach itself
 

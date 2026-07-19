@@ -1,0 +1,72 @@
+name: Release
+
+# jpackage cannot cross-compile - each OS's app-image must be built on that
+# OS (see README's Packaging section) - hence the matrix rather than a single
+# job. Triggered by pushing a version tag (e.g. v0.1.0); keep that tag in sync
+# with the `version` set in the root build.gradle.kts, since that's what
+# actually stamps the packaged app's version - the tag itself only names the
+# GitHub Release.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  # Creates the release once before any platform build starts. Three matrix jobs each trying to
+  # create-or-find the same tag's release in parallel is a real race; a separate job that runs
+  # first and that every build job then `needs` removes it entirely - by the time builds try to
+  # attach an asset, the release is guaranteed to already exist.
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: softprops/action-gh-release@v3
+
+  build:
+    needs: release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset-name: bpm-coach-linux-x64
+          - os: windows-latest
+            asset-name: bpm-coach-windows-x64
+          - os: macos-latest
+            asset-name: bpm-coach-macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Only bootstraps the Gradle process itself. The actual build/toolchain JDK is 26,
+      # auto-provisioned per-OS by the Foojay resolver plugin already declared in
+      # settings.gradle.kts (the same mechanism used for local dev, where only a JRE/older
+      # JDK is otherwise present) - so this doesn't need to match the project's target version.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      - name: Build native app-image
+        shell: bash
+        run: ./gradlew :desktop:jpackageImage --no-daemon
+
+      - name: Zip app-image (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        working-directory: desktop/build/jpackage
+        run: zip -r "../../../${{ matrix.asset-name }}.zip" bpm-coach
+
+      - name: Zip app-image (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: desktop/build/jpackage
+        run: Compress-Archive -Path bpm-coach -DestinationPath "../../../${{ matrix.asset-name }}.zip"
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: ${{ matrix.asset-name }}.zip

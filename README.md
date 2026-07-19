@@ -80,10 +80,10 @@ backends behind one API:
 | Windows | WinRT | SimpleBLE-backed; not field-tested by us on real hardware yet |
 | macOS | CoreBluetooth | SimpleBLE-backed; not field-tested by us on real hardware yet |
 
-SimpleJavaBLE isn't published to Maven Central, so its jar and per-OS native
-libraries are vendored under `desktop/libs/` and
-`desktop/src/main/resources/native/<os>/`. It's licensed under **BUSL-1.1**
-(free for non-commercial use, including this project) - see
+SimpleJavaBLE isn't published to Maven Central, so its jar is vendored under
+`desktop/libs/` - the jar bundles its own native libraries per architecture
+internally, so nothing else needs vendoring separately. It's licensed under
+**BUSL-1.1** (free for non-commercial use, including this project) - see
 [`NOTICE.md`](NOTICE.md) for the full license note. Unlike the Android
 reference client this project started from, SimpleJavaBLE has no
 `requestConnectionPriority` equivalent - each OS's BLE stack owns that
@@ -318,22 +318,61 @@ successful reading, one mid-connect). Two app-side defenses:
 
 ## Packaging
 
-Native, no-JVM-required bundles via [jlink](https://openjdk.org/jeps/282) +
-[jpackage](https://openjdk.org/jeps/392) (through the Badass-JLink Gradle
-plugin). **jpackage cannot cross-compile** - each OS's installer must be
-built on that OS:
+Native, no-JVM-required app-images via [jlink](https://openjdk.org/jeps/282) +
+[jpackage](https://openjdk.org/jeps/392), through the **Badass-Runtime**
+Gradle plugin (`org.beryx.runtime`) - not Badass-JLink, which this project
+used originally. That plugin's own docs say plainly it's for modular apps
+only (a proper `module-info.java`, which this project doesn't have) and
+fails outright without one; Badass-Runtime is its non-modular counterpart.
+**jpackage cannot cross-compile** - each OS's app-image must be built on
+that OS:
 
 ```bash
-./gradlew :desktop:jpackage
+./gradlew :desktop:jpackageImage
 ```
 
-produces a `.deb`/`.rpm` on Linux, `.msi`/`.exe` on Windows, `.pkg`/`.dmg` on
-macOS, in `desktop/build/jlinkbase/jlinkjars` / `desktop/build/jpackage`.
+produces a portable app-image (a folder with a native launcher and a
+bundled, trimmed-down JRE - no separate installer/uninstaller) at
+`desktop/build/jpackage/bpm-coach/`, runnable via `bin/bpm-coach` (or
+`bpm-coach.exe` on Windows) with no JDK on the target machine. The GitHub
+Actions workflow at `.github/workflows/release.yml` builds this on all
+three OSes in a matrix (jpackage cannot cross-compile, so there's no way
+around three separate jobs) and attaches the zipped result to a GitHub
+Release whenever a `v*` tag is pushed - keep that tag in sync with this
+project's own `version` (set in the root `build.gradle.kts`), since that's
+what actually stamps the packaged app's version.
 
 The installed app defaults to live mode, same as running from source - there's
 no separate packaging-time override needed. A double-clicked icon has no way
 to pass `--mode=demo`, but that's the point: the shipped product should assume
 real hardware unless told otherwise.
+
+**Two non-obvious things, found getting this working for the first time**
+(nobody had actually run `jpackage` in this project before - the command
+above was previously undocumented-and-untested folklore):
+
+- This plugin's own module auto-detection scans class files with a bundled,
+  outdated shaded ASM that throws `Unsupported class file major version 70`
+  on every one of this project's Java 26-compiled classes, silently
+  swallowing the exception and falling back to a near-empty module set -
+  the packaged app would launch and immediately fail with "JavaFX runtime
+  components are missing." Worked around by declaring the actual module set
+  explicitly (derived from a real `jdeps` run, which handles major version
+  70 fine) and manually resolving `--module-path` for javafx's module jars
+  from the project's own resolved classpath, since the plugin's normal
+  auto-wiring for that also piggybacks on the same broken scan. See the
+  comments in `desktop/build.gradle.kts`'s `runtime {}` block.
+- `NativeLibraryLoader` (inside SimpleJavaBLE's own jar) never read from
+  this project's own `desktop/src/main/resources/native/<os>/` folder at
+  all - confirmed by decompiling it, it extracts from `/native/<arch>/`
+  bundled **inside the vendored jar itself** (`desktop/libs/simplejavable-1.0.0.jar`
+  already contains correct natives for `x64` and `aarch64`, covering every
+  GitHub-hosted runner architecture used above). That project-level folder
+  was always unused, and for Linux and macOS specifically held the
+  *wrong*-architecture library by mistake from initial vendoring - harmless
+  only because nothing ever read it. Removed; see `NOTICE.md` for the
+  corrected vendoring note (only the jar itself is vendored - it's
+  self-contained).
 
 ## Testing
 

@@ -94,7 +94,13 @@ public final class MainApp extends Application {
     // shutdown hook is registered, so the refused launch can't clean up the winner's state.
     acquireSingleInstanceLockOrExit();
 
-    boolean demo = getParameters().getUnnamed().contains("--mode=demo");
+    // NOT getUnnamed(): confirmed by decompiling JavaFX's own ParametersImpl
+    // (isNamedParam/computeNamedParams) that any "--key=value" argument - "--mode=demo" included -
+    // is classified as a NAMED parameter and stripped out of getUnnamed() entirely. Checking
+    // getUnnamed() here meant this flag has done nothing since the very first commit: the app
+    // always launched with SimpleBleTransport regardless of --mode, which is why "demo mode"
+    // behaved differently depending on whether real hardware happened to be nearby.
+    boolean demo = "demo".equals(getParameters().getNamed().get("mode"));
 
     rosterStore = new RosterStore(RosterStore.defaultLocation());
     List<Student> savedRoster = rosterStore.load();
