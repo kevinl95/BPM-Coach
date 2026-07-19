@@ -113,8 +113,20 @@ public final class MainApp extends Application {
     // otherwise skips transport.shutdown() entirely - confirmed against real hardware, that
     // leaves a band connected at the OS/BlueZ level with no process left to disconnect it, so the
     // *next* launch's scan finds nothing at all. A shutdown hook runs on both paths.
+    //
+    // haltJvm() here too, not just after cleanup: a SIGINT/SIGTERM-triggered shutdown still ends
+    // with the JVM waiting for every non-daemon thread to finish before it can actually exit,
+    // same as the plain window-close path haltJvm()'s own javadoc explains - this hook doesn't
+    // get a free pass from that. Runtime.halt() is explicitly safe to call from within an
+    // already-running shutdown hook (it just skips waiting on anything further, hooks included).
     Runtime.getRuntime()
-        .addShutdownHook(new Thread(this::cleanupWithinDeadline, "bpm-coach-cleanup"));
+        .addShutdownHook(
+            new Thread(
+                () -> {
+                  cleanupWithinDeadline();
+                  haltJvm();
+                },
+                "bpm-coach-cleanup"));
   }
 
   @Override
@@ -217,6 +229,23 @@ public final class MainApp extends Application {
     // Thread when the window closes, and a blocking native disconnect here would freeze the UI
     // instead of letting the app quit.
     cleanupWithinDeadline();
+    haltJvm();
+  }
+
+  /**
+   * Confirmed against a real packaged build: closing the window normally (clicking the close
+   * button, not Ctrl+C) leaves the process running forever, invisibly holding the single-instance
+   * lock, so the *next* launch is refused. A full thread dump on the stuck process showed exactly
+   * one non-daemon thread besides the JVM's own bookkeeping - "Thread-2", the persistent native BLE
+   * adapter event-dispatch thread SimpleBleTransport registers once for the app's lifetime (kept
+   * alive deliberately, elsewhere, to avoid an earlier native-crash bug from listener churn). That
+   * thread is attached via JNI as non-daemon and never exits on its own, so the JVM's normal "wait
+   * for every non-daemon thread to finish" shutdown never completes, however cleanly our own Java
+   * code shuts down. {@code halt()} sidesteps that entirely: called only after our own bounded
+   * cleanup has already run, it stops the JVM immediately without waiting on anything further.
+   */
+  private void haltJvm() {
+    Runtime.getRuntime().halt(0);
   }
 
   /**
