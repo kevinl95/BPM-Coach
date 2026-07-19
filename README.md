@@ -31,7 +31,8 @@ core/                       no GUI, no OS-specific code - independently testable
   domain/       Student, Band, ZoneConfig, Zone, HeartRateReading (records)
   transport/    BleTransport interface - the seam between domain and BLE stack
   session/      ClassSession (reactive, java.util.concurrent.Flow) + BandPoller
-                (StructuredTaskScope fan-out) - the concurrent polling pipeline
+                (StructuredTaskScope fan-out, persistent per-band links) - the
+                concurrent polling pipeline
   persistence/  RosterStore - persists paired students/bands across launches
 
 desktop/                    JavaFX GUI + the two BleTransport implementations
@@ -159,6 +160,31 @@ by default with no extra setup - watch for `WARNING` lines when
   correct, complete length is worth reporting - unlike the truncation case
   above, this would be a genuine anomaly once reassembly is in place.
 
+### Scans find other devices, but never the band (0 devices / "Unknown device")
+
+Before blaming the band, check for a second running instance of the app:
+
+```bash
+ps aux | grep MainApp | grep -v grep
+```
+
+Two live-mode instances on one machine silently break each other: both cycle
+discovery on the same adapter, BlueZ's per-session duplicate filtering then
+suppresses re-reports of already-seen devices, and each instance logs
+`Scan cycle N complete: 0 device(s)` forever while `connect()` fails with
+`Unknown device <address> - scan() before connect()`. This happened twice
+during development, both times from an orphaned instance: killing a
+`./gradlew :desktop:run` invocation (Ctrl+C on the client, a closed terminal,
+`timeout`) can kill the Gradle *client* while the forked daemon and the app
+JVM it launched keep running, invisibly, for days.
+
+The app now refuses to start a second instance (a file lock at
+`~/.bpmcoach/app.lock`, released automatically by the OS however the process
+exits) and says so explicitly, so this failure mode is loud instead of
+silent. If you see that refusal message with no visible app window, the
+orphaned process from the `ps` line above is the one holding the lock - kill
+it and relaunch.
+
 ### Band not showing up at all (not even in a raw OS-level scan)
 
 If `BandDiscovery`'s scan cycles keep reporting the band's address as not
@@ -182,18 +208,61 @@ exit
 
 ### One good reading, then silence
 
-If polling gets exactly one valid reading and then times out on every
-subsequent attempt (connect and write both keep succeeding, but no
-notification - not even the band's own ACK - ever comes back), this matches
-a specific gap in the protocol flow: per the documented exchange in
-Gadgetbridge issue #5640 (the same capture our reference 86bpm test vector
-comes from), the host is expected to acknowledge every `DATA_HR` frame it
-receives with a fixed reply (`LaxasfitProtocol.CMD_HR_DATA_ACK`). An
-unacknowledged record can leave the band waiting on a host it now considers
-unresponsive. `BandPoller` now sends this ack unconditionally for every
-`DATA_HR` frame (empty, stale-looking, or good) as soon as it's parsed -
-verified against the documented frame bytes and independently re-derived
-via `LaxasfitProtocol.crc()` before being added, not just copied in.
+Confirmed against real hardware: the first connect/measure worked and
+returned a genuine reading, then every subsequent round timed out - and the
+diagnostic ack below showed *nothing at all* came back on those rounds, so
+the command wasn't reaching the band. The tell was in the timing: the first
+connect took ~8s (a real BLE handshake), but every reconnect after that
+returned in ~3s and wrote immediately, with the write reporting success yet
+no response ever arriving. That's a **stale connection** - after the first
+connect/measure/disconnect cycle, `connect()` claims success and
+`isConnected()` returns true, but the actual radio link is dead, so the
+write goes into a void. It lines up with the one thing the Android reference
+client flags that this desktop BLE binding structurally can't do:
+`requestConnectionPriority(HIGH)`, which the reference explicitly credits
+for fixing exactly this GATT timeout.
+
+The fix is architectural: `BandPoller` now holds **one persistent connection
+per band** and re-issues `CMD_HR_START` on that same open link every round,
+instead of connecting and disconnecting each time. This sidesteps the
+reconnect churn entirely and fits continuous classroom monitoring better
+than connect-per-reading did. Link health is judged purely by observed
+behaviour - a round with no frames at all (not even an ack) counts as a
+miss, and only after two consecutive silent rounds is the link torn down and
+reconnected. `isConnected()` is deliberately never trusted for this, since
+it was the very call that lied during the stale-reconnect bug.
+
+**Scaling past the adapter's connection cap.** BLE adapters cap concurrent
+connections at ~7-10, so the persistent pool holds at most
+`BandPoller.MAX_LIVE_CONNECTIONS` (7) links. A larger roster rotates
+*residency* in the pool opportunistically, with rules taken directly from a
+controlled reconnect experiment on the real band:
+
+- Reconnects work reliably **if and only if** the band was sighted
+  advertising just beforehand (verified: repeated disconnect/reconnect
+  cycles in one process, each gated on a fresh sighting, all came up live
+  with the command-ack arriving in ~70ms). Connecting blind to a cached
+  address is what produced every dead link.
+- After a disconnect the band takes a minute or more to re-advertise -
+  sometimes not at all until nudged, if it's lying still. On a wrist in an
+  active PE class it should stay awake; that part is untested.
+
+So: an unlinked band is admitted to the pool only on a fresh advertisement
+sighting (`BandDiscovery` timestamps every sighting and `BandPoller` checks
+it before any connect), admissions go least-recently-serviced first so
+nobody starves, and each admission evicts the longest-resident link, which
+then re-advertises and cycles back in naturally. At or under the cap,
+nothing ever rotates - every band just stays resident. A roster of 9 mock
+bands is covered by an integration test asserting every student gets data
+within two rounds and the pool never exceeds the cap.
+
+Independently of the connection model, the documented protocol flow
+(Gadgetbridge issue #5640, the same capture our reference 86bpm test vector
+comes from) has the host acknowledge every `DATA_HR` frame with a fixed
+reply (`LaxasfitProtocol.CMD_HR_DATA_ACK`); `BandPoller` sends this ack
+unconditionally for every `DATA_HR` frame (empty, stale-looking, or good) as
+soon as it's parsed - verified against the documented frame bytes and
+independently re-derived via `LaxasfitProtocol.crc()` before being added.
 
 Two related ideas surfaced during that investigation that are **not**
 implemented, since they couldn't be verified with the same confidence (and
@@ -215,6 +284,37 @@ place, which argues against either being strictly required):
 above - came from a second AI reviewer, Fable, given the repo to review
 independently. Verified against the primary source and re-derived
 arithmetically before implementing, same as the frame-truncation finding.)
+
+A useful diagnostic fell out of this: the band's *immediate* ack to the
+HR-start command is a documented, fixed frame - it shows up in the logs as
+`Ack [FD 00 05 1C 02 0D 00 0A 01]` within a second of the write. If a poll
+round doesn't even show that, the problem isn't the measurement (the band
+never heard the command, or its reply never made it back over the radio);
+if the ack arrives but no `HeartRate` frame follows within ~10-15s, the
+command was received and the measurement side is what didn't deliver.
+
+### Native crashes (SIGSEGV) under concurrent scan + connection
+
+Two hard JVM crashes during development (SIGSEGV in `jni_CallObjectMethodV`
+on the binding's native event thread - a use-after-free, not a catchable
+exception) shared one circumstance: `BandDiscovery`'s continuous scan loop
+was restarting scan sessions at the same time as a connection was going
+through a state transition (one crash during teardown right after a
+successful reading, one mid-connect). Two app-side defenses:
+
+- `SimpleBleTransport.close()` runs in the deliberately unconventional
+  order *disconnect, drain, unsubscribe*: `unsubscribe()` frees the native
+  side's only reference to the notification callback (the binding keeps no
+  Java-side reference - confirmed by bytecode inspection), so the physical
+  link is dropped first, guaranteeing no new dispatch can start, and a
+  short drain lets anything mid-flight finish before the callback is freed.
+  The poller also waits for its HR data ack write to actually flush before
+  releasing the connection for teardown.
+- Scanning and connecting no longer overlap at all: the poll loop pauses
+  `BandDiscovery` for the duration of each poll round and resumes it
+  between rounds. Beyond the crash, scanning concurrently with a live
+  connection starves it of radio time on a cheap adapter - which matched
+  whole rounds where not even the immediate command-ack above arrived.
 
 ## Packaging
 

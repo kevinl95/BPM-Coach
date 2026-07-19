@@ -68,6 +68,57 @@ class FrameReassemblerTest {
     assertArrayEquals(bpCmd, completed.get(1));
   }
 
+  @Test
+  void resyncsPastAnOrphanByteThatIsNotAFrameStart() {
+    // Simulates exactly the failure mode found on real hardware: a subscriber attaching after
+    // peripheral.notify() already enabled notifications (or a genuinely dropped fragment) can
+    // leave a leftover byte at the head of the buffer that isn't a real frame start. Without
+    // resync, that byte's neighbors get misread as a length prefix and the buffer waits forever
+    // for a frame that will never complete - silencing the whole connection instead of costing
+    // one frame.
+    FrameReassembler reassembler = new FrameReassembler();
+    byte[] orphan = LaxasfitProtocol.hex("56"); // an arbitrary trailing byte, not 0xDF or 0xFD
+    byte[] realFrame =
+        LaxasfitProtocol.hex("df 00 11 a1 05 01 04 00 0c 34 28 00 01 00 00 ed fb 00 00 00 56");
+
+    List<byte[]> completed = reassembler.accept(concat(orphan, realFrame));
+
+    assertEquals(1, completed.size(), "the orphan byte must be skipped, not block the real frame");
+    assertArrayEquals(realFrame, completed.get(0));
+  }
+
+  @Test
+  void resyncsWhenAPlausibleMarkerHasAnImplausibleLength() {
+    // Covers the case the marker check alone can't catch: a byte that happens to equal a real
+    // marker (0xDF) but isn't actually a frame start, so its neighbors produce a length far
+    // beyond any real frame in this protocol.
+    FrameReassembler reassembler = new FrameReassembler();
+    byte[] bogusHeader =
+        LaxasfitProtocol.hex("df ff ff"); // marker byte, then an implausible length
+    byte[] realFrame = LaxasfitProtocol.hex("fd 00 03 00 02 10 0d");
+
+    List<byte[]> completed = reassembler.accept(concat(bogusHeader, realFrame));
+
+    assertEquals(1, completed.size());
+    assertArrayEquals(realFrame, completed.get(0));
+  }
+
+  @Test
+  void resyncIsFedAcrossMultipleAcceptCallsNotJustOneChunk() {
+    // The desync doesn't have to resolve within a single accept() call - a genuinely poisoned
+    // buffer (several bad bytes in a row) must still recover once real frame bytes eventually
+    // arrive, however many separate notifications that takes.
+    FrameReassembler reassembler = new FrameReassembler();
+    byte[] garbage = LaxasfitProtocol.hex("11 22 33 44 55");
+    byte[] realFrame = LaxasfitProtocol.hex("fd 00 03 00 02 10 0d");
+
+    assertTrue(reassembler.accept(garbage).isEmpty());
+    List<byte[]> completed = reassembler.accept(realFrame);
+
+    assertEquals(1, completed.size());
+    assertArrayEquals(realFrame, completed.get(0));
+  }
+
   private static byte[] concat(byte[] a, byte[] b) {
     byte[] out = new byte[a.length + b.length];
     System.arraycopy(a, 0, out, 0, a.length);

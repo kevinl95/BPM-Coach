@@ -6,6 +6,7 @@ import java.lang.System.Logger.Level;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Flow;
 import java.util.concurrent.SubmissionPublisher;
@@ -34,7 +35,13 @@ public final class BandDiscovery {
   private final BleTransport transport;
   private final Object knownLock = new Object();
   private final Map<String, DiscoveredDevice> known = new LinkedHashMap<>();
+  // Monotonic timestamp of each address's most recent advertisement sighting - backs the
+  // com.loeffler.bpmcoach.transport.Sightings gate BandPoller uses before any connect attempt.
+  private final Map<String, Long> seenNanos = new ConcurrentHashMap<>();
   private final SubmissionPublisher<DiscoveredDevice> updates = new SubmissionPublisher<>();
+  private final Object pauseLock = new Object();
+  private boolean paused;
+  private volatile CountDownLatch cycleInFlight = new CountDownLatch(0);
   private volatile boolean running;
   private Thread loopThread;
 
@@ -55,6 +62,44 @@ public final class BandDiscovery {
     updates.close();
   }
 
+  /**
+   * Blocks until any in-flight scan cycle finishes, then keeps further cycles from starting until
+   * {@link #resume()}. Called by the poll loop before every batch of band connections: scanning
+   * concurrently with a live connection is what crashed the JVM twice (see SimpleBleTransport's
+   * close() comment - the native binding's event dispatch races connection-state transitions when
+   * scan sessions restart underneath them, and it dies with a SIGSEGV, not an exception), and on a
+   * cheap adapter it also starves the connection of radio time, which matches whole poll rounds
+   * where not even the band's documented immediate command-ack arrived.
+   */
+  public void pause() {
+    synchronized (pauseLock) {
+      paused = true;
+    }
+    try {
+      cycleInFlight.await(SCAN_CYCLE_TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+    }
+  }
+
+  /** Lets the scan loop run again after {@link #pause()}. */
+  public void resume() {
+    synchronized (pauseLock) {
+      paused = false;
+      pauseLock.notifyAll();
+    }
+  }
+
+  /**
+   * True if {@code address} was sighted advertising within the last {@code window}. Matches the
+   * {@link com.loeffler.bpmcoach.transport.Sightings} functional shape; {@code MainApp} passes
+   * {@code discovery::seenWithin} to {@code BandPoller} as its connect gate.
+   */
+  public boolean seenWithin(String address, java.time.Duration window) {
+    Long seen = seenNanos.get(address);
+    return seen != null && System.nanoTime() - seen <= window.toNanos();
+  }
+
   /** In first-discovered order, stable across repeated scan cycles. */
   public Map<String, DiscoveredDevice> knownDevices() {
     synchronized (knownLock) {
@@ -70,9 +115,23 @@ public final class BandDiscovery {
     LOG.log(Level.INFO, "Starting continuous background scan");
     int cycle = 0;
     while (running) {
+      try {
+        synchronized (pauseLock) {
+          while (paused) {
+            pauseLock.wait();
+          }
+        }
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        return;
+      }
+      if (!running) {
+        return;
+      }
       cycle++;
       int cycleNumber = cycle;
       CountDownLatch cycleDone = new CountDownLatch(1);
+      cycleInFlight = cycleDone;
       AtomicInteger seenThisCycle = new AtomicInteger();
       transport
           .scan()
@@ -86,6 +145,7 @@ public final class BandDiscovery {
                 @Override
                 public void onNext(DiscoveredDevice device) {
                   seenThisCycle.incrementAndGet();
+                  seenNanos.put(device.address(), System.nanoTime());
                   synchronized (knownLock) {
                     known.put(device.address(), device);
                   }

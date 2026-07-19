@@ -14,6 +14,15 @@ import com.loeffler.bpmcoach.session.BandAssignment;
 import com.loeffler.bpmcoach.session.BandPoller;
 import com.loeffler.bpmcoach.session.ClassSession;
 import com.loeffler.bpmcoach.transport.BleTransport;
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.lang.System.Logger.Level;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -38,21 +47,37 @@ import javafx.stage.Stage;
  */
 public final class MainApp extends Application {
 
+  private static final System.Logger LOG = System.getLogger(MainApp.class.getName());
+
   private static final int DEMO_BAND_COUNT = 8;
   private static final long EMPTY_ROSTER_POLL_DELAY_SECONDS = 2;
-  // A round can return almost instantly if every band fails fast (e.g. not yet seen by
-  // BandDiscovery's scan this session: SimpleBleTransport.connect() rejects an undiscovered
-  // address immediately, it doesn't wait out the connect timeout). Without a floor, that turns
-  // into a tight CPU-spinning retry loop instead of just waiting for the next scan cycle to
-  // possibly find the band.
-  private static final long MIN_ROUND_INTERVAL_SECONDS = 5;
+  // Slept after every round, unconditionally. Two jobs: it prevents a tight retry spin when a
+  // round returns instantly (every band failing fast), and - more importantly - it guarantees
+  // BandDiscovery at least one full resumed scan cycle (~6s) between rounds, which is what
+  // produces the fresh advertisement sightings BandPoller's rotation admissions are gated on.
+  private static final long INTER_ROUND_DISCOVERY_SECONDS = 8;
+  // cleanup() makes native BLE teardown calls (disconnect/unsubscribe) that this binding gives
+  // no timeout for and that have been observed to block indefinitely - a real process hung past
+  // 12s on SIGTERM and only died to SIGKILL. Since cleanup() also runs from the JVM shutdown
+  // hook, a hang there is precisely what stops SIGTERM from ever taking effect (and, because the
+  // hung process keeps holding the single-instance lock, blocks the next launch too). The clean
+  // disconnect is a courtesy that leaves the band advertising for the next launch, never a
+  // correctness requirement - the OS reclaims every native handle on exit - so bounding the wait
+  // and exiting anyway is always safe.
+  private static final Duration CLEANUP_TIMEOUT = Duration.ofSeconds(4);
 
   private ClassSession session;
   private BleTransport transport;
   private BandDiscovery discovery;
   private RosterStore rosterStore;
   private ExecutorService pollingExecutor;
+  private volatile BandPoller poller;
   private final AtomicBoolean cleanedUp = new AtomicBoolean();
+
+  // Held for the whole process lifetime; the OS releases it on exit, however abrupt. Never
+  // read after acquisition - existence of the lock IS the point.
+  @SuppressWarnings("unused")
+  private FileLock instanceLock;
 
   public static void main(String[] args) {
     launch(args);
@@ -60,6 +85,15 @@ public final class MainApp extends Application {
 
   @Override
   public void init() {
+    // Before anything else - especially before touching the Bluetooth adapter. A second live
+    // instance doesn't fail loudly: both instances cycle discovery on the same adapter, BlueZ's
+    // per-session duplicate filtering then suppresses re-reports of already-seen devices, and
+    // each instance just logs "0 devices" forever. Confirmed against real hardware, twice: an
+    // orphaned instance (a killed Gradle client leaving its forked app JVM running) silently
+    // broke every scan of the visible instance. Exiting here is deliberately before the
+    // shutdown hook is registered, so the refused launch can't clean up the winner's state.
+    acquireSingleInstanceLockOrExit();
+
     boolean demo = getParameters().getUnnamed().contains("--mode=demo");
 
     rosterStore = new RosterStore(RosterStore.defaultLocation());
@@ -73,7 +107,8 @@ public final class MainApp extends Application {
     // otherwise skips transport.shutdown() entirely - confirmed against real hardware, that
     // leaves a band connected at the OS/BlueZ level with no process left to disconnect it, so the
     // *next* launch's scan finds nothing at all. A shutdown hook runs on both paths.
-    Runtime.getRuntime().addShutdownHook(new Thread(this::cleanup, "bpm-coach-cleanup"));
+    Runtime.getRuntime()
+        .addShutdownHook(new Thread(this::cleanupWithinDeadline, "bpm-coach-cleanup"));
   }
 
   @Override
@@ -100,7 +135,10 @@ public final class MainApp extends Application {
 
   private void startPolling() {
     pollingExecutor = Executors.newVirtualThreadPerTaskExecutor();
-    BandPoller poller = new BandPoller(transport, session);
+    // discovery::seenWithin is the connect gate: BandPoller only attempts a connect (initial,
+    // reconnect, or rotation admission) for a band sighted advertising recently - connecting to
+    // a non-advertising cached address yields a dead link, per the reconnect experiment.
+    poller = new BandPoller(transport, session, discovery::seenWithin);
     pollingExecutor.submit(
         () -> {
           while (!Thread.currentThread().isInterrupted()) {
@@ -114,25 +152,46 @@ public final class MainApp extends Application {
               }
               continue;
             }
-            long roundStart = System.nanoTime();
-            for (List<BandAssignment> batch : BandPoller.batch(assignments)) {
-              if (Thread.currentThread().isInterrupted()) {
-                return;
-              }
-              try {
-                poller.pollBatch(batch);
-              } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return;
-              }
+            // Scanning and connecting/measuring must not overlap - see BandDiscovery.pause() for
+            // the JVM-crash and starved-connection evidence. Discovery resumes between rounds (the
+            // persistent band links stay open across the pause), so the pairing view still sees
+            // fresh scan results between measurement windows - and rotation admissions get the
+            // sightings they're gated on.
+            discovery.pause();
+            try {
+              poller.pollRound(assignments);
+            } catch (InterruptedException e) {
+              Thread.currentThread().interrupt();
+              return;
+            } finally {
+              discovery.resume();
             }
-            long elapsedSeconds = (System.nanoTime() - roundStart) / 1_000_000_000L;
-            long remaining = MIN_ROUND_INTERVAL_SECONDS - elapsedSeconds;
-            if (remaining > 0 && !sleepQuietly(remaining)) {
+            if (!sleepQuietly(INTER_ROUND_DISCOVERY_SECONDS)) {
               return;
             }
           }
         });
+  }
+
+  private void acquireSingleInstanceLockOrExit() {
+    Path lockPath = RosterStore.defaultLocation().resolveSibling("app.lock");
+    try {
+      Files.createDirectories(lockPath.getParent());
+      FileChannel channel =
+          FileChannel.open(lockPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+      instanceLock = channel.tryLock();
+    } catch (IOException e) {
+      throw new UncheckedIOException("Could not open instance lock " + lockPath, e);
+    }
+    if (instanceLock == null) {
+      LOG.log(
+          Level.ERROR,
+          "Another BPM Coach instance is already running (instance lock {0} is held). Two"
+              + " instances silently break each other's Bluetooth scanning - close the other one"
+              + " (check for an orphaned process: ps aux | grep MainApp) and relaunch.",
+          lockPath);
+      System.exit(1);
+    }
   }
 
   /** Returns false if interrupted (caller should stop), true if the sleep completed normally. */
@@ -148,7 +207,35 @@ public final class MainApp extends Application {
 
   @Override
   public void stop() {
-    cleanup();
+    // Bounded for the same reason the shutdown hook is: stop() runs on the JavaFX Application
+    // Thread when the window closes, and a blocking native disconnect here would freeze the UI
+    // instead of letting the app quit.
+    cleanupWithinDeadline();
+  }
+
+  /**
+   * Runs {@link #cleanup()} but never blocks the caller past {@link #CLEANUP_TIMEOUT}. See that
+   * constant for why an unbounded cleanup is actively dangerous here (hung SIGTERM, held lock). The
+   * worker is a daemon so that, if a native call really is wedged, its lingering thread can't
+   * itself keep the JVM alive.
+   */
+  private void cleanupWithinDeadline() {
+    Thread worker = new Thread(this::cleanup, "bpm-coach-cleanup-worker");
+    worker.setDaemon(true);
+    worker.start();
+    try {
+      worker.join(CLEANUP_TIMEOUT.toMillis());
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      return;
+    }
+    if (worker.isAlive()) {
+      LOG.log(
+          Level.WARNING,
+          "BLE cleanup didn''t finish within {0}s (a native disconnect is blocking); exiting"
+              + " anyway - the OS reclaims the connection.",
+          CLEANUP_TIMEOUT.toSeconds());
+    }
   }
 
   /** Idempotent: reachable both from the normal stop() lifecycle and the shutdown hook. */
@@ -159,6 +246,12 @@ public final class MainApp extends Application {
     discovery.stop();
     if (pollingExecutor != null) {
       pollingExecutor.shutdownNow();
+    }
+    // Close the persistent band links explicitly before the transport's belt-and-suspenders
+    // sweep, so each open connection gets its clean per-link teardown (disconnect leaves the
+    // band advertising for the next launch).
+    if (poller != null) {
+      poller.closeAll();
     }
     transport.shutdown();
     session.close();

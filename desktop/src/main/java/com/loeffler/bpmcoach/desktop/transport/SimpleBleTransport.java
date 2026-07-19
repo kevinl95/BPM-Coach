@@ -44,6 +44,9 @@ public final class SimpleBleTransport implements BleTransport {
   // found" even though the band is genuinely connected - confirmed against real hardware.
   private static final Duration SERVICE_DISCOVERY_TIMEOUT = Duration.ofSeconds(6);
   private static final Duration SERVICE_DISCOVERY_POLL_INTERVAL = Duration.ofMillis(200);
+  // How long close() waits between disconnect and unsubscribe for an in-flight notification
+  // dispatch to finish - see close() for the crash this prevents.
+  private static final Duration CALLBACK_DRAIN = Duration.ofMillis(150);
 
   private final Adapter adapter;
   private final Map<String, Peripheral> discovered = new ConcurrentHashMap<>();
@@ -153,6 +156,19 @@ public final class SimpleBleTransport implements BleTransport {
     for (SimplePeripheralConnection connection : Set.copyOf(openConnections)) {
       connection.close();
     }
+    // A connect() still in flight at shutdown isn't in openConnections yet (it's only added
+    // once the connect completes), but the OS-level link it's establishing outlives this
+    // process all the same - and a band left half-connected stops advertising, so the next
+    // launch can't even find it. Best-effort sweep of everything the scan ever saw.
+    for (Peripheral peripheral : discovered.values()) {
+      try {
+        if (peripheral.isConnected()) {
+          peripheral.disconnect();
+        }
+      } catch (RuntimeException ignored) {
+        // best-effort: we're exiting either way
+      }
+    }
   }
 
   private static void awaitUartService(Peripheral peripheral, String address) {
@@ -181,11 +197,37 @@ public final class SimpleBleTransport implements BleTransport {
   private final class SimplePeripheralConnection implements BandConnection {
     private final Peripheral peripheral;
     private final SubmissionPublisher<byte[]> notifications = new SubmissionPublisher<>();
+    private final AtomicBoolean notifyStarted = new AtomicBoolean();
     private final AtomicBoolean closed = new AtomicBoolean();
+    // Guards every native call on this peripheral (write, unsubscribe, disconnect). SimpleBLE
+    // makes no thread-safety promise for concurrent native calls on the same Peripheral, and
+    // BandPoller's own HR-start writes (main polling thread) can otherwise overlap with an
+    // ack write fired from the notification-delivery thread. This also means close() blocks
+    // until any in-flight write finishes instead of tearing the connection down mid-write.
+    private final Object nativeLock = new Object();
+
+    // Held as a field for the connection's whole lifetime, not passed as an inline lambda:
+    // Peripheral.notify() hands the callback straight into native code without keeping any
+    // Java-side reference (confirmed by bytecode inspection - same hazard as the adapter
+    // EventListener whose churn caused the earlier scan SIGSEGV). It also must never throw
+    // back through the JNI boundary: after close(), SubmissionPublisher.submit() throws
+    // IllegalStateException, and a pending Java exception inside a native callback thread is
+    // exactly the kind of thing this binding won't handle gracefully.
+    private final Peripheral.DataCallback notifyCallback =
+        data -> {
+          if (closed.get()) {
+            return;
+          }
+          try {
+            notifications.submit(data);
+          } catch (IllegalStateException ignored) {
+            // closed concurrently; a late notification is expected, not an error
+          }
+        };
 
     SimplePeripheralConnection(Peripheral peripheral) {
       this.peripheral = peripheral;
-      peripheral.notify(SERVICE, TX_CHARACTERISTIC, notifications::submit);
+      // notify() is deliberately NOT called here - see notifications().
     }
 
     @Override
@@ -193,12 +235,36 @@ public final class SimpleBleTransport implements BleTransport {
       // writeRequest (ATT write-with-response) to mirror the Android reference
       // client's WRITE_TYPE_DEFAULT, which the real band is confirmed to ACK.
       return CompletableFuture.runAsync(
-          () -> peripheral.writeRequest(SERVICE, RX_CHARACTERISTIC, frame));
+          () -> {
+            synchronized (nativeLock) {
+              if (closed.get()) {
+                // A fire-and-forget write (BandPoller's HR data ack) can be queued behind a
+                // close() already holding the lock; refuse cleanly rather than poking a
+                // peripheral whose native state was just torn down.
+                throw new BleException("Connection already closed");
+              }
+              peripheral.writeRequest(SERVICE, RX_CHARACTERISTIC, frame);
+            }
+          });
     }
 
     @Override
     public Flow.Publisher<byte[]> notifications() {
-      return notifications;
+      // As in SimpleBleTransport.scan(): the subscriber must be registered on the underlying
+      // publisher BEFORE peripheral.notify() actually enables notifications at the GATT/CCCD
+      // level, or whatever the band pushes in that window is silently dropped
+      // (SubmissionPublisher never replays to a late subscriber) - and worse, with
+      // FrameReassembler now stateful per connection, a dropped fragment there means the
+      // reassembler's very first byte is a mid-frame orphan, desyncing the whole connection
+      // rather than costing one frame.
+      return subscriber -> {
+        notifications.subscribe(subscriber);
+        if (notifyStarted.compareAndSet(false, true)) {
+          synchronized (nativeLock) {
+            peripheral.notify(SERVICE, TX_CHARACTERISTIC, notifyCallback);
+          }
+        }
+      };
     }
 
     @Override
@@ -209,12 +275,31 @@ public final class SimpleBleTransport implements BleTransport {
         return;
       }
       openConnections.remove(this);
-      try {
-        peripheral.unsubscribe(SERVICE, TX_CHARACTERISTIC);
-      } catch (RuntimeException ignored) {
-        // best-effort: the peripheral may already be gone
+      // Disconnect BEFORE unsubscribe, the reverse of the conventional order, and confirmed
+      // against a real crash dump (hs_err: SIGSEGV in jni_CallObjectMethodV on the binding's
+      // native callback thread, null Method*): unsubscribe() frees the native side's only
+      // reference to notifyCallback, and the band can still have a notification in flight at
+      // that moment - it now reliably does, because BandPoller's host-side HR data ack
+      // provokes one more response right as a successful poll tears down. Dropping the
+      // physical link first guarantees no new dispatch can start; the short drain then lets
+      // any dispatch already running finish before unsubscribe frees the callback under it.
+      synchronized (nativeLock) {
+        try {
+          peripheral.disconnect();
+        } catch (RuntimeException ignored) {
+          // best-effort: the peripheral may already be gone
+        }
+        try {
+          Thread.sleep(CALLBACK_DRAIN.toMillis());
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+        }
+        try {
+          peripheral.unsubscribe(SERVICE, TX_CHARACTERISTIC);
+        } catch (RuntimeException ignored) {
+          // best-effort: some backends reject unsubscribe on a disconnected peripheral
+        }
       }
-      peripheral.disconnect();
       notifications.close();
     }
   }
