@@ -6,7 +6,10 @@ plugins {
 
 allprojects {
     group = "com.loeffler.bpmcoach"
-    version = "0.1.0"
+    // jpackage's macOS bundler rejects any version whose first component is 0 ("The first
+    // number in an app-version cannot be zero or negative") - confirmed on real CI, Linux
+    // packaged 0.1.0 fine but macOS did not. Any 0.x.y is permanently invalid there.
+    version = "1.0.0"
 
     repositories {
         mavenCentral()
