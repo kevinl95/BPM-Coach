@@ -24,6 +24,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -65,6 +66,10 @@ public final class MainApp extends Application {
   // correctness requirement - the OS reclaims every native handle on exit - so bounding the wait
   // and exiting anyway is always safe.
   private static final Duration CLEANUP_TIMEOUT = Duration.ofSeconds(4);
+  // Backstop deadline for the whole shutdown. Must exceed CLEANUP_TIMEOUT so the graceful teardown
+  // gets its full window first; past this, a detached OS process SIGKILLs us. See
+  // scheduleForceKill.
+  private static final Duration FORCE_KILL_DELAY = Duration.ofSeconds(7);
 
   private ClassSession session;
   private BleTransport transport;
@@ -114,19 +119,10 @@ public final class MainApp extends Application {
     // leaves a band connected at the OS/BlueZ level with no process left to disconnect it, so the
     // *next* launch's scan finds nothing at all. A shutdown hook runs on both paths.
     //
-    // haltJvm() here too, not just after cleanup: a SIGINT/SIGTERM-triggered shutdown still ends
-    // with the JVM waiting for every non-daemon thread to finish before it can actually exit,
-    // same as the plain window-close path haltJvm()'s own javadoc explains - this hook doesn't
-    // get a free pass from that. Runtime.halt() is explicitly safe to call from within an
-    // already-running shutdown hook (it just skips waiting on anything further, hooks included).
-    Runtime.getRuntime()
-        .addShutdownHook(
-            new Thread(
-                () -> {
-                  cleanupWithinDeadline();
-                  haltJvm();
-                },
-                "bpm-coach-cleanup"));
+    // Same shutDown() as the window-close and stop() paths - see its javadoc for why the halt()
+    // inside it is required even here (the JVM otherwise waits forever on the non-daemon native
+    // BLE thread).
+    Runtime.getRuntime().addShutdownHook(new Thread(this::shutDown, "bpm-coach-cleanup"));
   }
 
   @Override
@@ -146,6 +142,14 @@ public final class MainApp extends Application {
 
     stage.setTitle("BPM Coach");
     stage.setScene(scene);
+    // Handle the window's close button explicitly instead of trusting the Application.stop()
+    // lifecycle to fire. Confirmed against a real packaged build: closing the window left the
+    // process running forever, still logging scan cycles - i.e. stop() was never called at all, so
+    // neither the cleanup nor the halt() in it ran. A CLOSE_REQUEST handler is the direct,
+    // documented signal that the user clicked X, and doesn't depend on implicit-exit semantics or
+    // on how many native top-level windows the platform actually created. shutDown() is idempotent,
+    // so the stop()/shutdown-hook paths reaching it too (Platform.exit, SIGTERM) is harmless.
+    stage.setOnCloseRequest(event -> shutDown());
     stage.show();
 
     startPolling();
@@ -225,27 +229,65 @@ public final class MainApp extends Application {
 
   @Override
   public void stop() {
-    // Bounded for the same reason the shutdown hook is: stop() runs on the JavaFX Application
-    // Thread when the window closes, and a blocking native disconnect here would freeze the UI
-    // instead of letting the app quit.
-    cleanupWithinDeadline();
-    haltJvm();
+    // Reached on the Platform.exit() path (not the window-close button - that's handled by the
+    // stage's CLOSE_REQUEST handler, see start()). Same idempotent teardown either way.
+    shutDown();
   }
 
   /**
-   * Confirmed against a real packaged build: closing the window normally (clicking the close
-   * button, not Ctrl+C) leaves the process running forever, invisibly holding the single-instance
-   * lock, so the *next* launch is refused. A full thread dump on the stuck process showed exactly
-   * one non-daemon thread besides the JVM's own bookkeeping - "Thread-2", the persistent native BLE
-   * adapter event-dispatch thread SimpleBleTransport registers once for the app's lifetime (kept
-   * alive deliberately, elsewhere, to avoid an earlier native-crash bug from listener churn). That
-   * thread is attached via JNI as non-daemon and never exits on its own, so the JVM's normal "wait
-   * for every non-daemon thread to finish" shutdown never completes, however cleanly our own Java
-   * code shuts down. {@code halt()} sidesteps that entirely: called only after our own bounded
-   * cleanup has already run, it stops the JVM immediately without waiting on anything further.
+   * The single teardown path, reached from all three ways the app can end: the window's close
+   * button ({@code setOnCloseRequest}), the {@link #stop()} lifecycle ({@code Platform.exit()}),
+   * and the JVM shutdown hook (Ctrl+C/SIGTERM).
+   *
+   * <p>Getting the process to actually die turned out to need two layers, both established
+   * empirically against a real build:
+   *
+   * <ul>
+   *   <li>{@code halt()} rather than a normal return: SimpleBLE registers a persistent native BLE
+   *       event-dispatch thread ("Thread-2") for the app's lifetime, attached via JNI as non-daemon
+   *       and never exiting on its own, so the JVM's normal "wait for every non-daemon thread"
+   *       shutdown never completes. {@code halt()} skips that wait.
+   *   <li>An out-of-process SIGKILL backstop, because {@code halt()} ITSELF intermittently hangs
+   *       (~1 in 5 runs, measured): it requests a VM-exit safepoint, and that same native thread
+   *       can be in a state the VM can't safepoint over, wedging the process so hard that even
+   *       SIGQUIT gets no response. Nothing running inside the JVM can escape that - a watchdog
+   *       thread would be frozen at the same safepoint - so {@link #scheduleForceKill} spawns a
+   *       separate OS process, before halting, that SIGKILLs us if we're still alive past {@link
+   *       #FORCE_KILL_DELAY}. The kernel honours SIGKILL with zero process cooperation.
+   * </ul>
+   *
+   * <p>The bounded {@link #cleanupWithinDeadline} in between is best-effort courtesy (a clean BLE
+   * disconnect leaves the band advertising for the next launch); it's allowed to fail or hang
+   * because both layers above guarantee the process dies regardless.
    */
-  private void haltJvm() {
+  private void shutDown() {
+    scheduleForceKill();
+    cleanupWithinDeadline();
     Runtime.getRuntime().halt(0);
+  }
+
+  /**
+   * Spawns a detached OS process that SIGKILLs this JVM after {@link #FORCE_KILL_DELAY} if it's
+   * still alive - the only reliable escape from a wedged {@code halt()} (see {@link #shutDown}).
+   * Started before the halt, since once the VM wedges no in-JVM code can run. If the halt succeeds
+   * normally (the common case), we're long gone before the timer fires and the kill is a no-op.
+   */
+  private void scheduleForceKill() {
+    long pid = ProcessHandle.current().pid();
+    long delay = FORCE_KILL_DELAY.toSeconds();
+    boolean windows = System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win");
+    ProcessBuilder pb =
+        windows
+            ? new ProcessBuilder(
+                "cmd", "/c", "timeout /t " + delay + " >nul & taskkill /F /PID " + pid)
+            : new ProcessBuilder("sh", "-c", "sleep " + delay + "; kill -9 " + pid);
+    try {
+      pb.start();
+    } catch (IOException e) {
+      // Best-effort: if we can't even spawn the watchdog, halt() is still our first line of
+      // defense and works most of the time. Nothing better to do here.
+      LOG.log(Level.WARNING, "Could not start exit watchdog process", e);
+    }
   }
 
   /**
