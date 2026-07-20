@@ -10,8 +10,18 @@ import java.util.concurrent.Flow;
  */
 public interface BleTransport {
 
-  /** Starts scanning; discovered devices are pushed until the subscription is cancelled. */
+  /**
+   * Starts scanning; discovered devices are pushed indefinitely and the publisher does not
+   * self-complete - call {@link #stopScan()} to end it (e.g. to give a live connection exclusive
+   * radio access). Calling {@code scan()} again after {@link #stopScan()} starts a fresh scan.
+   */
   Flow.Publisher<DiscoveredDevice> scan();
+
+  /**
+   * Stops whatever scan is currently running, if any; safe to call with no scan active. No-op by
+   * default; real transports with an underlying native scan session should override this.
+   */
+  default void stopScan() {}
 
   /** Connects to a discovered device, requesting a high-priority/tight connection interval. */
   CompletableFuture<BandConnection> connect(DiscoveredDevice device);

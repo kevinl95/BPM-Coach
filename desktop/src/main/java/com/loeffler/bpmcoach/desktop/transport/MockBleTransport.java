@@ -3,6 +3,7 @@ package com.loeffler.bpmcoach.desktop.transport;
 import com.loeffler.bpmcoach.protocol.LaxasfitProtocol;
 import com.loeffler.bpmcoach.session.BandPoller;
 import com.loeffler.bpmcoach.transport.BandConnection;
+import com.loeffler.bpmcoach.transport.BleException;
 import com.loeffler.bpmcoach.transport.BleTransport;
 import com.loeffler.bpmcoach.transport.DiscoveredDevice;
 import java.util.List;
@@ -12,6 +13,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Flow;
 import java.util.concurrent.SubmissionPublisher;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.IntStream;
 
 /**
@@ -24,9 +26,15 @@ public final class MockBleTransport implements BleTransport {
 
   private static final int CMD_HR_START_ID = LaxasfitProtocol.cmdId(LaxasfitProtocol.CMD_HR_START);
   private static final double FINGER_OFF_PROBABILITY = 0.05;
+  // Simulated re-advertising interval, mirroring a real band's continuous advertising: matters for
+  // BandPoller's Sightings gate, which needs a fresh timestamp per address periodically, not just
+  // once at startup.
+  private static final long READVERTISE_INTERVAL_MILLIS = 2000;
 
   private final List<DiscoveredDevice> simulatedDevices;
   private final Map<String, MockBandState> states = new ConcurrentHashMap<>();
+  private final AtomicReference<SubmissionPublisher<DiscoveredDevice>> activeScan =
+      new AtomicReference<>();
 
   public MockBleTransport(int bandCount) {
     this.simulatedDevices =
@@ -50,21 +58,42 @@ public final class MockBleTransport implements BleTransport {
   @Override
   public Flow.Publisher<DiscoveredDevice> scan() {
     SubmissionPublisher<DiscoveredDevice> publisher = new SubmissionPublisher<>();
-    // SubmissionPublisher doesn't replay: emission must not start until the
-    // subscriber is actually registered, or early items are silently dropped.
-    // subscribe() registers synchronously before returning (only onSubscribe's
-    // delivery is async), so starting the emitter here is race-free.
+    if (!activeScan.compareAndSet(null, publisher)) {
+      throw new BleException("A scan is already in progress");
+    }
+    // Continuous, matching SimpleBleTransport's real scanStart()/scanStop() contract (see
+    // BleTransport.scan()'s javadoc): re-emits every simulated device's presence periodically
+    // instead of a single burst, so a mock band's advertisement sighting stays fresh the same way
+    // a real one's does. Keeps going until stopScan() closes this publisher.
+    //
+    // SubmissionPublisher doesn't replay: emission must not start until the subscriber is
+    // actually registered, or early items are silently dropped. subscribe() registers
+    // synchronously before returning (only onSubscribe's delivery is async), so starting the
+    // emitter here is race-free.
     return subscriber -> {
       publisher.subscribe(subscriber);
       Thread.startVirtualThread(
           () -> {
-            for (DiscoveredDevice device : simulatedDevices) {
-              publisher.submit(device);
-              sleep(150);
+            while (!publisher.isClosed()) {
+              for (DiscoveredDevice device : simulatedDevices) {
+                if (publisher.isClosed()) {
+                  return;
+                }
+                publisher.submit(device);
+                sleep(150);
+              }
+              sleep(READVERTISE_INTERVAL_MILLIS);
             }
-            publisher.close();
           });
     };
+  }
+
+  @Override
+  public void stopScan() {
+    SubmissionPublisher<DiscoveredDevice> active = activeScan.getAndSet(null);
+    if (active != null) {
+      active.close();
+    }
   }
 
   @Override

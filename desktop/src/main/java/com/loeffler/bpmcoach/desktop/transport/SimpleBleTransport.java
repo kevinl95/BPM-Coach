@@ -37,7 +37,6 @@ public final class SimpleBleTransport implements BleTransport {
       new BluetoothUUID("6e400002-b5a3-f393-e0a9-e50e24dcca9f");
   private static final BluetoothUUID TX_CHARACTERISTIC =
       new BluetoothUUID("6e400003-b5a3-f393-e0a9-e50e24dcca9f");
-  private static final int SCAN_WINDOW_MILLIS = 5000;
   // peripheral.connect() returns once the physical link is up, which is NOT the same moment
   // BlueZ finishes resolving the peripheral's GATT service table (a separate, asynchronous
   // step). Calling notify()/writeRequest() before that finishes fails with "Service ... not
@@ -111,23 +110,46 @@ public final class SimpleBleTransport implements BleTransport {
     if (!activeScan.compareAndSet(null, publisher)) {
       throw new BleException("A scan is already in progress");
     }
-    // As in MockBleTransport: don't start the scan until the subscriber is
-    // actually registered, or early discoveries are silently dropped
-    // (SubmissionPublisher never replays to late subscribers).
+    // Real continuous scan (scanStart/scanStop), not the previous repeated adapter.scanFor(5s)
+    // bursts. Confirmed against real hardware: restarting a fresh scanFor() burst every few
+    // seconds, forever, reliably crashed the JVM with a native SIGSEGV in a JNI callback on the
+    // adapter's own event-dispatch thread after roughly 8-11 restarts - a stable, persistent
+    // Adapter.EventListener (see the constructor) wasn't enough on its own, since the churn is in
+    // repeatedly starting/stopping the native scan session itself, a separate thing from
+    // listener object churn. A single scanStart() that just keeps running until the caller
+    // actually cancels its subscription removes that churn entirely during normal operation -
+    // the adapter only ever stops scanning when BandDiscovery.pause() deliberately cancels (to
+    // give a live connection exclusive radio access), which is far less frequent than the old
+    // fixed ~6s cycle.
+    //
+    // As in MockBleTransport: don't start the scan until the subscriber is actually registered,
+    // or early discoveries are silently dropped (SubmissionPublisher never replays to late
+    // subscribers).
     return subscriber -> {
       publisher.subscribe(subscriber);
-      Thread.startVirtualThread(
-          () -> {
-            try {
-              adapter.scanFor(SCAN_WINDOW_MILLIS);
-            } catch (Exception e) {
-              SubmissionPublisher<DiscoveredDevice> active = activeScan.getAndSet(null);
-              if (active != null) {
-                active.closeExceptionally(new BleException("Scan failed", e));
-              }
-            }
-          });
+      try {
+        adapter.scanStart();
+      } catch (RuntimeException e) {
+        SubmissionPublisher<DiscoveredDevice> active = activeScan.getAndSet(null);
+        if (active != null) {
+          active.closeExceptionally(new BleException("Scan failed to start", e));
+        }
+      }
     };
+  }
+
+  @Override
+  public void stopScan() {
+    SubmissionPublisher<DiscoveredDevice> active = activeScan.getAndSet(null);
+    if (active == null) {
+      return;
+    }
+    try {
+      adapter.scanStop();
+    } catch (RuntimeException ignored) {
+      // best-effort: the adapter may already consider itself stopped
+    }
+    active.close();
   }
 
   @Override

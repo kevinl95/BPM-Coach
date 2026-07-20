@@ -9,7 +9,6 @@ import com.loeffler.bpmcoach.protocol.FrameParser;
 import com.loeffler.bpmcoach.protocol.LaxasfitProtocol;
 import com.loeffler.bpmcoach.transport.BandConnection;
 import com.loeffler.bpmcoach.transport.DiscoveredDevice;
-import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Flow;
 import java.util.concurrent.TimeUnit;
@@ -103,11 +102,17 @@ class MockBleTransportTest {
   }
 
   @Test
-  void scanEmitsExactlyTheKnownDevices() throws Exception {
+  void scanEmitsExactlyTheKnownDevicesAndKeepsGoingUntilStopped() throws Exception {
+    // scan() no longer self-completes after one burst (see BleTransport.scan()'s javadoc) - it
+    // re-advertises continuously, matching real hardware's actual behavior, until stopScan() is
+    // called. This drains the first full pass (all 3 distinct addresses seen), confirms a second
+    // pass arrives on its own without re-subscribing, then confirms stopScan() actually ends it.
     MockBleTransport transport = new MockBleTransport(3);
-    List<DiscoveredDevice> found =
-        java.util.Collections.synchronizedList(new java.util.ArrayList<>());
-    CountDownLatch done = new CountDownLatch(1);
+    java.util.Set<String> distinctAddresses = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    CountDownLatch sawSecondPass = new CountDownLatch(1);
+    CountDownLatch completed = new CountDownLatch(1);
+    java.util.concurrent.atomic.AtomicInteger totalSeen =
+        new java.util.concurrent.atomic.AtomicInteger();
     transport
         .scan()
         .subscribe(
@@ -119,21 +124,29 @@ class MockBleTransportTest {
 
               @Override
               public void onNext(DiscoveredDevice item) {
-                found.add(item);
+                distinctAddresses.add(item.address());
+                if (totalSeen.incrementAndGet() > 3) {
+                  sawSecondPass.countDown();
+                }
               }
 
               @Override
               public void onError(Throwable throwable) {
-                done.countDown();
+                completed.countDown();
               }
 
               @Override
               public void onComplete() {
-                done.countDown();
+                completed.countDown();
               }
             });
 
-    assertTrue(done.await(5, TimeUnit.SECONDS));
-    assertEquals(3, found.size());
+    assertTrue(sawSecondPass.await(10, TimeUnit.SECONDS), "expected re-advertising, not one burst");
+    assertEquals(3, distinctAddresses.size());
+    assertFalse(
+        completed.await(0, TimeUnit.SECONDS), "must not self-complete while still scanning");
+
+    transport.stopScan();
+    assertTrue(completed.await(5, TimeUnit.SECONDS), "stopScan() must end the subscription");
   }
 }

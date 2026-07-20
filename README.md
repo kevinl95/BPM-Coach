@@ -55,11 +55,6 @@ required). `--enable-preview` is wired into compile/test/run for
 | Sequenced collections | `ClassSession.historyFor` | `.reversed()` for "most recent first" |
 | `java.util.concurrent.Flow` | `ClassSession` → GUI | Keeps `core` GUI-agnostic; desktop marshals onto the FX thread |
 
-**Vector API (JEP 529): deliberately not used.** There's no SIMD-worthy hot
-path - the CRC is an 8-bit sum over <25 bytes and aggregates run over a few
-dozen students. Forcing it in would be the "old logic, new coat of paint" the
-contest warns against.
-
 ## Running it
 
 Needs only a JDK to *start* Gradle; the wrapper auto-provisions the real Java 26
@@ -117,9 +112,7 @@ persistent pool is capped at `BandPoller.MAX_LIVE_CONNECTIONS` (7). A larger
 roster rotates residency: an unlinked band is admitted only when `BandDiscovery`
 has sighted it advertising recently (connecting blind yields a dead link),
 least-recently-serviced first, evicting the longest-resident link. At or under
-the cap nothing rotates. A `>7`-band integration test covers this. One untested
-assumption: it depends on evicted bands re-advertising promptly, which they may
-not do if lying still - a worn band in an active class should stay awake.
+the cap nothing rotates.
 
 ## Troubleshooting
 
